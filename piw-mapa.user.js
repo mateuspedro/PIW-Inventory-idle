@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.3.1
 // @description  Lista simplificada de hunts do Poke Idle World, com filtros, favoritos e teleporte. Recorte do módulo de mapa do PIW-QOL.
-// @author       Você (baseado em Desjunior / JulianoCLI)
+// @author       Kizanin
 // @match        https://poke.idleworld.online/play
 // @grant        none
 // @run-at       document-start
