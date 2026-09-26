@@ -7,6 +7,8 @@
 // @match        https://poke.idleworld.online/play
 // @grant        none
 // @run-at       document-start
+// @updateURL    https://raw.githubusercontent.com/mateuspedro/PIW-MAP/main/piw-mapa.user.js
+// @downloadURL  https://raw.githubusercontent.com/mateuspedro/PIW-MAP/main/piw-mapa.user.js
 // ==/UserScript==
 
 (function() {
