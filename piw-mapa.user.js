@@ -1,14 +1,12 @@
 // ==UserScript==
 // @name         PIW — Mapa Simplificado (isolado)
 // @namespace    http://tampermonkey.net/
-// @version      1.3.1
-// @description  Lista simplificada de hunts do Poke Idle World, com filtros, favoritos e teleporte. Recorte do módulo de mapa do PIW-QOL.
-// @author       Kizanin
+// @version      1.4.1
+// @description  Lista simplificada de hunts do Poke Idle World + lista de inventário (balls/potions/revives) no canto direito.
+// @author       KizaniN
 // @match        https://poke.idleworld.online/play
 // @grant        none
 // @run-at       document-start
-// @updateURL    https://raw.githubusercontent.com/mateuspedro/PIW-MAP/main/piw-mapa.user.js
-// @downloadURL  https://raw.githubusercontent.com/mateuspedro/PIW-MAP/main/piw-mapa.user.js
 // ==/UserScript==
 
 (function() {
@@ -24,6 +22,7 @@
     const STORAGE_NAV_MODE         = 'script_nav_tp_mode_v1';
     const STORAGE_PRIMARY_FAVORITE = 'script_primary_favorite_v1';
     const STORAGE_CAUGHT_POKEMON   = 'script_caught_pokemon_v1';
+    const STORAGE_INV_PANEL_OPEN   = 'script_inv_panel_open_v1';
 
     const MAP_MARKERS_API_URL      = '/api/game/map-markers';
     const CHARACTERS_ME_URL        = '/api/characters/me';
@@ -42,6 +41,8 @@
     let renderTimeout           = null;
     let activeTooltip           = null;
     let lastActiveRegion        = null;
+    let inventoryRenderTimeout  = null;
+    let lastInventorySignature  = '';
 
     const globalCreatureApiData  = new Map();
     const globalHuntMarkerData   = new Map();
@@ -980,7 +981,164 @@
     }
 
     // ============================================================
-    // 15) TOOLTIP / NOTIFICAÇÕES / BOTÃO DE NAVEGAÇÃO
+    // 15) PAINEL DE INVENTÁRIO (BALLS / POTIONS / REVIVES)
+    // ============================================================
+    const INVENTORY_CATEGORIES = [
+        {
+            id: 'balls',
+            label: '🔴 Poké Bolas',
+            match: (name, alt, iconSrc) => {
+                const n = (name || alt || '').toLowerCase();
+                const src = (iconSrc || '').toLowerCase();
+                return /\b(pok[eé]\s*ball|great\s*ball|super\s*ball|ultra\s*ball|idle\s*ball|master\s*ball)\b/.test(n)
+                    || /markitems\/(pokeball|greatball|superball|ultraball|idleball|masterball)\.png/.test(src);
+            }
+        },
+        {
+            id: 'potions',
+            label: '💊 Poções',
+            match: (name, alt, iconSrc) => {
+                const n = (name || alt || '').toLowerCase();
+                const src = (iconSrc || '').toLowerCase();
+                return /\bpotion\b|\bpotions\b/.test(n)
+                    || /markitems\/(small_potion|great_potion|ultra_potion|hyper_potion|ultimate_potion)\.png/.test(src);
+            }
+        },
+        {
+            id: 'revives',
+            label: '✨ Revives',
+            match: (name, alt, iconSrc) => {
+                const n = (name || alt || '').toLowerCase();
+                const src = (iconSrc || '').toLowerCase();
+                return /\brevive\b|\brevives\b/.test(n)
+                    || /markitems\/(revive|max_revive)\.png/.test(src);
+            }
+        }
+    ];
+
+    function readInventoryFromDOM() {
+        const grid = document.querySelector('.inv-grid');
+        if (!grid) return null;
+
+        const entries = [];
+        grid.querySelectorAll('.inv-slot').forEach(slot => {
+            if (slot.classList.contains('empty')) return;
+            // Ignora slots de Pokémon da equipe
+            if (slot.classList.contains('inv-poke')) return;
+
+            const img = slot.querySelector('img.inv-ico, img.poke-icon-img, img');
+            if (!img) return;
+
+            const alt = (img.getAttribute('alt') || '').trim();
+            const title = (slot.getAttribute('title') || '').trim();
+            const name = alt || title.split('—')[0].trim();
+            if (!name) return;
+
+            const iconSrc = img.getAttribute('src') || '';
+            const qtyEl = slot.querySelector('.inv-qty');
+            const qtyText = (qtyEl?.textContent || '').trim();
+            const qty = qtyText ? (parseInt(qtyText.replace(/[^0-9]/g, ''), 10) || 1) : 1;
+
+            entries.push({ name, alt, title, iconSrc, qty });
+        });
+        return entries;
+    }
+
+    function buildInventoryData() {
+        const raw = readInventoryFromDOM();
+        if (!raw) return null;
+
+        const grouped = { balls: [], potions: [], revives: [] };
+        raw.forEach(entry => {
+            for (const cat of INVENTORY_CATEGORIES) {
+                if (cat.match(entry.name, entry.alt, entry.iconSrc)) {
+                    grouped[cat.id].push(entry);
+                    break;
+                }
+            }
+        });
+
+        // Ordena cada grupo por nome (Poké Ball antes de Great Ball, etc.)
+        Object.keys(grouped).forEach(key => {
+            grouped[key].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+        });
+        return grouped;
+    }
+
+    function ensureInventoryPanel() {
+        let panel = document.getElementById('script-inv-panel');
+        if (panel) return panel;
+
+        panel = document.createElement('div');
+        panel.id = 'script-inv-panel';
+        panel.style = 'position:fixed;right:8px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:6px;background:rgba(20,16,10,.88);border:2px solid rgb(120,90,40);border-radius:10px;padding:8px 6px;z-index:9000;max-height:80vh;overflow:hidden;font-family:sans-serif;color:#e2e8f0;';
+        panel.innerHTML = `
+            <button id="script-inv-toggle" type="button" title="Mostrar/ocultar inventário"
+                style="background:transparent;border:0;color:#ffcc00;font-size:18px;font-weight:bold;width:40px;height:36px;border-radius:8px;cursor:pointer;">🎒</button>
+            <div id="script-inv-body" style="display:none;width:230px;max-height:70vh;overflow-y:auto;padding-right:2px;">
+                <div id="script-inv-content"></div>
+            </div>
+        `;
+        document.body.appendChild(panel);
+
+        const toggleBtn = panel.querySelector('#script-inv-toggle');
+        const body = panel.querySelector('#script-inv-body');
+        const open = localStorage.getItem(STORAGE_INV_PANEL_OPEN) === 'true';
+        body.style.display = open ? 'block' : 'none';
+        toggleBtn.style.color = open ? '#ffcc00' : '#a0aec0';
+
+        toggleBtn.addEventListener('click', () => {
+            const isOpen = body.style.display !== 'none';
+            body.style.display = isOpen ? 'none' : 'block';
+            toggleBtn.style.color = isOpen ? '#a0aec0' : '#ffcc00';
+            localStorage.setItem(STORAGE_INV_PANEL_OPEN, String(!isOpen));
+            if (!isOpen) renderInventoryPanel();
+        });
+
+        return panel;
+    }
+
+    function renderInventoryPanel() {
+        const panel = ensureInventoryPanel();
+        const body = panel.querySelector('#script-inv-body');
+        if (body.style.display === 'none') return;
+
+        const content = panel.querySelector('#script-inv-content');
+        const grouped = buildInventoryData();
+
+        if (!grouped) {
+            content.innerHTML = '<div style="padding:8px;color:#a0aec0;font-size:12px;text-align:center;">Abra o inventário do jogo para carregar os itens.</div>';
+            return;
+        }
+
+        const signature = JSON.stringify(grouped);
+        if (signature === lastInventorySignature && content.childElementCount) return;
+        lastInventorySignature = signature;
+
+        let html = '';
+        for (const cat of INVENTORY_CATEGORIES) {
+            const items = grouped[cat.id] || [];
+            html += `<div style="margin-bottom:8px;">
+                <div style="font-weight:800;font-size:12px;color:#d9c38c;border-bottom:1px solid #3a2c17;padding:4px 2px;margin-bottom:4px;">${cat.label}</div>`;
+            if (!items.length) {
+                html += '<div style="color:#718096;font-size:11px;padding:2px 4px;">—</div>';
+            } else {
+                items.forEach(item => {
+                    html += `
+                        <div style="display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:6px;background:rgba(255,255,255,.03);margin-bottom:3px;">
+                            <img src="${escapeHTML(item.iconSrc)}" alt="" style="width:24px;height:24px;object-fit:contain;image-rendering:pixelated;flex:none;">
+                            <span style="flex:1;min-width:0;font-size:12px;color:#e2e8f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHTML(item.name)}</span>
+                            <span style="font-weight:800;font-size:12px;color:#f6c453;flex:none;">×${formatNumber(item.qty)}</span>
+                        </div>`;
+                });
+            }
+            html += `</div>`;
+        }
+        content.innerHTML = html;
+    }
+
+    // ============================================================
+    // 16) TOOLTIP / NOTIFICAÇÕES / BOTÃO DE NAVEGAÇÃO
     // ============================================================
     function showDropTooltip(e, dropsHTML) {
         hideDropTooltip();
@@ -1061,7 +1219,7 @@
     }
 
     // ============================================================
-    // 16) ESTILO
+    // 17) ESTILO
     // ============================================================
     const styleMapMod = document.createElement('style');
     styleMapMod.id = 'simplifier-map-override';
@@ -1247,7 +1405,7 @@
     appendStyleWhenReady(styleMapMod);
 
     // ============================================================
-    // 17) INICIALIZAÇÃO
+    // 18) INICIALIZAÇÃO
     // ============================================================
     const observer = new MutationObserver(() => {
         if (renderTimeout) return;
@@ -1264,6 +1422,13 @@
                 }
                 buildSimpleList();
             }
+            if (document.querySelector('.inv-grid')) {
+                if (inventoryRenderTimeout) clearTimeout(inventoryRenderTimeout);
+                inventoryRenderTimeout = setTimeout(() => {
+                    inventoryRenderTimeout = null;
+                    renderInventoryPanel();
+                }, 150);
+            }
         }, 200);
     });
 
@@ -1273,6 +1438,7 @@
         loadTrainerLevel(true);
         refreshLeaderFromHud();
         applyMapScriptState();
+        ensureInventoryPanel();
         observer.observe(document.body, { childList: true, subtree: true });
 
         setInterval(() => {
@@ -1283,6 +1449,7 @@
                     if (document.querySelector('.map-window')) buildSimpleList();
                 }
             });
+            if (document.querySelector('.inv-grid')) renderInventoryPanel();
         }, 10000);
     }
     if (document.readyState === 'loading') {
