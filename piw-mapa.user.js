@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         PIW — Mapa Simplificado (isolado)
+// @name         PIW — Mapa Simplificado + Inventário em tempo real
 // @namespace    http://tampermonkey.net/
-// @version      1.5.0
-// @description  Lista simplificada de hunts do Poke Idle World + painel de inventário em tempo real.
+// @version      1.6.3
+// @description  Lista simplificada de hunts + painel de inventário lido via API interna do jogo (React context).
 // @author       KizaniN
 // @match        https://poke.idleworld.online/play
 // @grant        none
@@ -23,14 +23,15 @@
     const STORAGE_PRIMARY_FAVORITE = 'script_primary_favorite_v1';
     const STORAGE_CAUGHT_POKEMON   = 'script_caught_pokemon_v1';
     const STORAGE_INV_PANEL_OPEN   = 'script_inv_panel_open_v1';
+    const STORAGE_INV_CACHE        = 'script_inv_cache_v1';
 
     const MAP_MARKERS_API_URL      = '/api/game/map-markers';
     const CHARACTERS_ME_URL        = '/api/characters/me';
-    const INVENTORY_API_URL        = '/api/game/inventory';
+    const ITEMS_JSON_URL           = 'https://poke.idleworld.online/game/items.json';
     const POKEMON_TYPES_JSON_URL   = 'https://poke.idleworld.online/game/creatures.json';
 
-    // Intervalo de refresh do inventário (ms)
-    const INVENTORY_REFRESH_INTERVAL_MS = 3000;
+    const INVENTORY_HEARTBEAT_MS = 15000;
+    const INVENTORY_RENDER_MS    = 3000;
 
     // ============================================================
     // 1) ESTADO GLOBAL
@@ -48,18 +49,162 @@
     let inventoryRenderTimeout  = null;
     let lastInventorySignature  = '';
     let inventoryRefreshTimer   = null;
-    let inventoryFetchInFlight  = false;
+    let inventoryHeartbeatTimer = null;
+    let observerDebounceTimer   = null;
+    let gameContextPromise      = null;
+    let gameContext             = null;
+    let inventorySubscription   = null;
+    let ballsSubscription       = null;
+    let latestInventory         = null;
 
     const globalCreatureApiData  = new Map();
+    const globalItemApiData      = new Map();
     const globalHuntMarkerData   = new Map();
     const globalCaughtPokemonNames = new Set(loadCaughtPokemonCache());
 
-    // Cache do catálogo de itens (id -> { name, icon, category })
-    const globalItemCatalog = new Map();
-    let itemCatalogLoadPromise = null;
+    let inventoryCache = loadInventoryCacheFromStorage();
+    let inventoryLastLiveAt = 0;
 
     // ============================================================
-    // 2) UTILITÁRIOS BÁSICOS
+    // 2) GAME CONTEXT (React context do jogo)
+    // ============================================================
+    function findGameContextFromDOM() {
+        const hudElement = document.querySelector('.phud-name') || document.querySelector('.phud');
+        if (!hudElement) return null;
+        const fiberKey = Object.keys(hudElement).find(key => key.startsWith('__reactFiber$'));
+        if (!fiberKey) return null;
+        let fiber = hudElement[fiberKey];
+        for (let depth = 0; fiber && depth < 40; depth++, fiber = fiber.return) {
+            const value = fiber.memoizedProps?.value;
+            if (value && typeof value.subscribe === 'function' && typeof value.send === 'function') {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    function waitForGameContext(timeoutMs = 15000) {
+        if (gameContext) return Promise.resolve(gameContext);
+        if (gameContextPromise) return gameContextPromise;
+        gameContextPromise = new Promise(resolve => {
+            const deadline = Date.now() + timeoutMs;
+            const tick = () => {
+                const ctx = findGameContextFromDOM();
+                if (ctx) {
+                    gameContext = ctx;
+                    subscribeToInventory();
+                    return resolve(ctx);
+                }
+                if (Date.now() >= deadline) return resolve(null);
+                setTimeout(tick, 250);
+            };
+            tick();
+        });
+        return gameContextPromise;
+    }
+
+    function subscribeToInventory() {
+        if (!gameContext) return;
+
+        // 1) Evento inventory (poções, revives, stones, etc.)
+        if (!inventorySubscription) {
+            try {
+                inventorySubscription = gameContext.subscribe('inventory', message => {
+                    const items = Array.isArray(message?.items) ? message.items : [];
+                    if (!items.length) return;
+                    latestInventory = items;
+                    inventoryLastLiveAt = Date.now();
+                    mergeIntoInventoryCache(groupInventoryFromSocket(items));
+                    scheduleInventoryPanelRefresh();
+                });
+            } catch (e) {
+                console.warn('[PIW-QOL] Falha ao assinar inventory:', e);
+            }
+        }
+
+        // 2) Evento balls (Pokébolas — vêm separadas)
+        if (!ballsSubscription) {
+            try {
+                ballsSubscription = gameContext.subscribe('balls', message => {
+                    const catalog = Array.isArray(message?.catalog) ? message.catalog : [];
+                    const counts = message?.counts || {};
+                    if (!catalog.length) return;
+                    const entries = catalog.map(ball => {
+                        const qty = Number(counts[String(ball.id)] ?? 0);
+                        if (qty <= 0) return null;
+                        return {
+                            name: ball.name,
+                            iconSrc: ball.iconUrl || '',
+                            qty,
+                            cat: 'balls'
+                        };
+                    }).filter(Boolean);
+                    if (!entries.length) return;
+                    inventoryLastLiveAt = Date.now();
+                    mergeIntoInventoryCache(groupEntries(entries));
+                    scheduleInventoryPanelRefresh();
+                });
+            } catch (e) {
+                console.warn('[PIW-QOL] Falha ao assinar balls:', e);
+            }
+        }
+
+        // 3) Eventos que costumam mudar o inventário
+        ['field-kill', 'catch-result', 'poke-xp', 'item-use', 'ball-use', 'potion-use', 'revive', 'shop-buy']
+            .forEach(type => {
+                try {
+                    gameContext.subscribe(type, () => {
+                        setTimeout(() => requestInventoryFromGame(), 400);
+                    });
+                } catch { /* tipo pode não existir, ignora */ }
+            });
+    }
+
+    function requestInventoryFromGame() {
+        if (!gameContext) return false;
+        try {
+            gameContext.send({ type: 'inv-get' });
+            requestBallsFromGame();
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    function requestBallsFromGame() {
+        if (!gameContext) return false;
+        try {
+            if (typeof gameContext.requestBalls === 'function') {
+                gameContext.requestBalls();
+                return true;
+            }
+            gameContext.send({ type: 'balls-get' });
+            return true;
+        } catch { return false; }
+    }
+
+    function groupInventoryFromSocket(items) {
+        const grouped = { balls: [], potions: [], revives: [] };
+        (items || []).forEach(entry => {
+            const itemId = String(entry?.itemId ?? '').trim();
+            const qty = Number(entry?.quantity ?? 0);
+            if (!itemId || qty <= 0) return;
+            const catalog = globalItemApiData.get(itemId);
+            const name = catalog?.name || catalog?.title || `Item ${itemId}`;
+            const cat = categorizeByName(name);
+            if (!cat) return;
+            const iconRaw = catalog?.icon || catalog?.image || catalog?.sprite || '';
+            const iconSrc = normalizeGameItemIcon(iconRaw);
+            grouped[cat].push({ name, iconSrc, qty, cat });
+        });
+        Object.keys(grouped).forEach(key => {
+            grouped[key].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+        });
+        return grouped;
+    }
+
+    // ============================================================
+    // 3) UTILITÁRIOS
     // ============================================================
     function readStoredJSON(key, fallback) {
         const stored = localStorage.getItem(key);
@@ -98,17 +243,11 @@
             .replace(/\(.*\)/g, '')
             .trim());
     }
-    function preferenceEnabled(key) {
-        return localStorage.getItem(key) !== 'false';
-    }
     function loadCaughtPokemonCache() {
         try {
             const parsed = JSON.parse(localStorage.getItem(STORAGE_CAUGHT_POKEMON) || '[]');
             return Array.isArray(parsed) ? parsed : [];
         } catch { return []; }
-    }
-    function saveCaughtPokemonCache() {
-        localStorage.setItem(STORAGE_CAUGHT_POKEMON, JSON.stringify([...globalCaughtPokemonNames]));
     }
     function formatNumber(num) {
         return new Intl.NumberFormat('pt-BR').format(num);
@@ -119,8 +258,51 @@
         return `/assets/items/${String(icon).replace(/^\/+/, '')}`;
     }
 
+    function loadInventoryCacheFromStorage() {
+        try {
+            const parsed = JSON.parse(localStorage.getItem(STORAGE_INV_CACHE) || 'null');
+            if (parsed && typeof parsed === 'object') {
+                return {
+                    balls: Array.isArray(parsed.balls) ? parsed.balls : [],
+                    potions: Array.isArray(parsed.potions) ? parsed.potions : [],
+                    revives: Array.isArray(parsed.revives) ? parsed.revives : []
+                };
+            }
+        } catch { /* ignore */ }
+        return { balls: [], potions: [], revives: [] };
+    }
+    function saveInventoryCacheToStorage() {
+        try {
+            localStorage.setItem(STORAGE_INV_CACHE, JSON.stringify(inventoryCache));
+        } catch { /* ignore */ }
+    }
+    function mergeIntoInventoryCache(grouped) {
+        let changed = false;
+        for (const cat of ['balls', 'potions', 'revives']) {
+            const incoming = grouped[cat] || [];
+            if (!incoming.length) continue;
+            const current = inventoryCache[cat] || [];
+            const byName = new Map(current.map(e => [normalizePokemonName(e.name), e]));
+            incoming.forEach(entry => {
+                const key = normalizePokemonName(entry.name);
+                const existing = byName.get(key);
+                if (!existing) {
+                    byName.set(key, { ...entry });
+                    changed = true;
+                } else {
+                    if (existing.qty !== entry.qty) { existing.qty = entry.qty; changed = true; }
+                    if (!existing.iconSrc && entry.iconSrc) { existing.iconSrc = entry.iconSrc; changed = true; }
+                }
+            });
+            inventoryCache[cat] = Array.from(byName.values())
+                .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+        }
+        if (changed) saveInventoryCacheToStorage();
+        return changed;
+    }
+
     // ============================================================
-    // 3) TOKENS DA API DO JOGO
+    // 4) API DO JOGO (HTTP)
     // ============================================================
     function getGameTokens() {
         try {
@@ -161,34 +343,7 @@
     }
 
     // ============================================================
-    // 4) CATÁLOGO DE ITENS (items.json)
-    // ============================================================
-    function loadItemCatalog() {
-        if (itemCatalogLoadPromise) return itemCatalogLoadPromise;
-        itemCatalogLoadPromise = fetch('/game/items.json', { credentials: 'same-origin' })
-            .then(r => r.ok ? r.json() : null)
-            .then(payload => {
-                if (!payload) return globalItemCatalog;
-                const list = Array.isArray(payload) ? payload : (payload.items || Object.values(payload));
-                list.forEach(item => {
-                    if (!item || typeof item !== 'object') return;
-                    const id = String(item.id ?? item.key ?? '').trim();
-                    if (!id) return;
-                    globalItemCatalog.set(id, {
-                        id,
-                        name: item.name || item.title || '',
-                        icon: item.icon || item.image || item.sprite || item.img || '',
-                        category: String(item.category || '').toLowerCase()
-                    });
-                });
-                return globalItemCatalog;
-            })
-            .catch(() => globalItemCatalog);
-        return itemCatalogLoadPromise;
-    }
-
-    // ============================================================
-    // 5) CIDADES
+    // 5) CIDADES / FAVORITOS / MODOS
     // ============================================================
     const CITY_NAMES = /\b(?:cerulean(?: city)?|pewter(?: city)?|lavender(?: town)?|viridian(?: city)?|cassino|casino)\b/i;
     function isCityName(name) {
@@ -212,9 +367,6 @@
         return `--city-badge:"${badge}";width:38px;height:38px;`;
     }
 
-    // ============================================================
-    // 6) FAVORITOS / ÚLTIMA HUNT
-    // ============================================================
     function getFavorites() { return readStoredJSON(STORAGE_FAVS, []); }
     function saveLastHunt(huntName) {
         if (huntName && huntName !== 'Sem Nome' && !isCityName(huntName))
@@ -238,12 +390,8 @@
         buildSimpleList();
     }
 
-    // ============================================================
-    // 7) MODOS (drops / navegação)
-    // ============================================================
     function getDropMode() { return localStorage.getItem(STORAGE_DROP_MODE) || 'icon'; }
     function setDropMode(mode) { localStorage.setItem(STORAGE_DROP_MODE, mode); buildSimpleList(); }
-
     function getNavTpMode() {
         const mode = localStorage.getItem(STORAGE_NAV_MODE) || 'fav';
         return ['fav', 'last', 'off'].includes(mode) ? mode : 'fav';
@@ -254,32 +402,7 @@
     }
 
     // ============================================================
-    // 8) REGIÃO ATIVA
-    // ============================================================
-    function getActiveRegionName() {
-        const mapWindow = document.querySelector('.map-window');
-        if (!mapWindow) return null;
-        const title = mapWindow.querySelector('.ds-title, .map-title')?.textContent || '';
-        const match = title.match(/Mapa\s*·\s*(.+)$/i);
-        if (match && match[1]) return match[1].trim().toLowerCase();
-        const activePlate = mapWindow.querySelector('.map-plate.on');
-        if (activePlate) {
-            const img = activePlate.querySelector('img');
-            const alt = img?.getAttribute('alt') || img?.getAttribute('title') || '';
-            if (alt) return alt.trim().toLowerCase();
-        }
-        return null;
-    }
-    function getActiveRegionFromMarker(marker) {
-        const slug = marker?.dataset?.guide?.replace(/^hunt-/, '') || '';
-        if (!slug) return null;
-        const apiMarker = globalHuntMarkerData.get(slug.toLowerCase());
-        if (!apiMarker) return null;
-        return String(apiMarker.region || apiMarker.map || apiMarker.area || '').toLowerCase() || null;
-    }
-
-    // ============================================================
-    // 9) ÍNDICE DOS MARCADORES VIA API
+    // 6) MARCADORES / TIPOS POKÉMON
     // ============================================================
     function getMarkerName(marker) {
         return String(
@@ -339,9 +462,6 @@
         return globalHuntMarkerData.get(getCleanHuntName(huntName)) || null;
     }
 
-    // ============================================================
-    // 10) TIPOS POKÉMON
-    // ============================================================
     const TYPE_CHART = {
         normal: { rock: 0.5, ghost: 0, steel: 0.5 },
         fire: { fire: 0.5, water: 0.5, grass: 2, ice: 2, bug: 2, rock: 0.5, dragon: 0.5, steel: 2 },
@@ -363,11 +483,6 @@
         fairy: { fire: 0.5, fighting: 2, poison: 0.5, dragon: 2, dark: 2, steel: 0.5 }
     };
     let POKEMON_TYPES = {};
-    const POKEMON_NAME_ALIASES = {
-        nidoranfe: 'nidoran-f', 'nidoran female': 'nidoran-f', 'nidoran♀': 'nidoran-f',
-        nidoranma: 'nidoran-m', 'nidoran male': 'nidoran-m', 'nidoran♂': 'nidoran-m',
-        farfetchd: "farfetch'd", 'farfetch’d': "farfetch'd"
-    };
     function applyOutlandModifier(baseMultiplier) {
         if (baseMultiplier === 1.5) return 1.75;
         if (baseMultiplier === 2.0) return 2.50;
@@ -425,7 +540,7 @@
     }
 
     // ============================================================
-    // 11) NÍVEL DO TREINADOR
+    // 7) NÍVEL DO TREINADOR / LÍDER
     // ============================================================
     function readTrainerLevelFromDOM() {
         const tloc = document.querySelector('.phud-tloc');
@@ -482,9 +597,6 @@
         return trainerLevelPromise;
     }
 
-    // ============================================================
-    // 12) LÍDER DA EQUIPE — sempre o .phud-mon.active
-    // ============================================================
     function getLeaderPokemonFromHud() {
         const active = document.querySelector('div.phud-party > button.phud-mon.active')
             || document.querySelector('div.phud-party > button.phud-mon');
@@ -528,7 +640,7 @@
     }
 
     // ============================================================
-    // 13) DETALHES DA HUNT
+    // 8) DETALHES DA HUNT
     // ============================================================
     function extractHuntDetailsFromJSON(name, marker) {
         const cleanName = getCleanHuntName(name);
@@ -553,7 +665,7 @@
     }
 
     // ============================================================
-    // 14) TELEPORTE
+    // 9) TELEPORTE
     // ============================================================
     function clickMappedHunt(huntName) {
         const mappedHunt = findMappedHunt(huntName);
@@ -650,7 +762,7 @@
     }
 
     // ============================================================
-    // 15) LISTA SIMPLIFICADA
+    // 10) LISTA SIMPLIFICADA (MAPA)
     // ============================================================
     function isScriptMapActive() { return localStorage.getItem(STORAGE_SCRIPT_ACTIVE) !== 'false'; }
     function setScriptMapActive(state) {
@@ -669,7 +781,27 @@
             if (container) container.style.display = 'none';
         }
     }
-
+    function getActiveRegionName() {
+        const mapWindow = document.querySelector('.map-window');
+        if (!mapWindow) return null;
+        const title = mapWindow.querySelector('.ds-title, .map-title')?.textContent || '';
+        const match = title.match(/Mapa\s*·\s*(.+)$/i);
+        if (match && match[1]) return match[1].trim().toLowerCase();
+        const activePlate = mapWindow.querySelector('.map-plate.on');
+        if (activePlate) {
+            const img = activePlate.querySelector('img');
+            const alt = img?.getAttribute('alt') || img?.getAttribute('title') || '';
+            if (alt) return alt.trim().toLowerCase();
+        }
+        return null;
+    }
+    function getActiveRegionFromMarker(marker) {
+        const slug = marker?.dataset?.guide?.replace(/^hunt-/, '') || '';
+        if (!slug) return null;
+        const apiMarker = globalHuntMarkerData.get(slug.toLowerCase());
+        if (!apiMarker) return null;
+        return String(apiMarker.region || apiMarker.map || apiMarker.area || '').toLowerCase() || null;
+    }
     function simplifyNativeMapControls(mapWindow) {
         if (!mapWindow) return;
         const typeNames = new Set([
@@ -681,7 +813,6 @@
         const normalize = v => String(v || '').normalize('NFD')
             .replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
         const normalizedTypes = new Set([...typeNames].map(normalize));
-
         const candidates = Array.from(mapWindow.querySelectorAll('div, section, nav'))
             .map(el => ({
                 el,
@@ -692,14 +823,11 @@
             .filter(c => c.matches >= 8)
             .filter(c => !c.el.querySelector('.map-filter-q, .map-plate, .map-area, input'))
             .sort((a, b) => a.el.getBoundingClientRect().height - b.el.getBoundingClientRect().height);
-
         candidates[0]?.el.classList.add('script-hidden-native-types');
     }
-
     function injectCitiesButton(mapWindow) {
         const areasContainer = mapWindow.querySelector('.map-areas');
         if (!areasContainer) return null;
-
         let citiesBtn = areasContainer.querySelector('.script-city-area');
         if (!citiesBtn) {
             citiesBtn = document.createElement('button');
@@ -712,7 +840,6 @@
             const lastPlate = plates[plates.length - 1];
             if (lastPlate) lastPlate.insertAdjacentElement('afterend', citiesBtn);
             else areasContainer.appendChild(citiesBtn);
-
             citiesBtn.addEventListener('click', () => {
                 const isCities = mapWindow.dataset.scriptMapView === 'cities';
                 mapWindow.dataset.scriptMapView = isCities ? 'hunts' : 'cities';
@@ -1023,106 +1150,131 @@
     }
 
     // ============================================================
-    // 16) PAINEL DE INVENTÁRIO (BALLS / POTIONS / REVIVES)
-    //     Agora com atualização em TEMPO REAL via API + WebSocket
+    // 11) PAINEL DE INVENTÁRIO — GAME CONTEXT
     // ============================================================
     const INVENTORY_CATEGORIES = [
-        {
-            id: 'balls',
-            label: '🔴 Poké Bolas',
-            match: (name, alt, iconSrc) => {
-                const n = (name || alt || '').toLowerCase();
-                const src = (iconSrc || '').toLowerCase();
-                return /\b(pok[eé]\s*ball|great\s*ball|super\s*ball|ultra\s*ball|idle\s*ball|master\s*ball)\b/.test(n)
-                    || /markitems\/(pokeball|greatball|superball|ultraball|idleball|masterball)\.png/.test(src);
-            }
-        },
-        {
-            id: 'potions',
-            label: '💊 Poções',
-            match: (name, alt, iconSrc) => {
-                const n = (name || alt || '').toLowerCase();
-                const src = (iconSrc || '').toLowerCase();
-                return /\bpotion\b|\bpotions\b/.test(n)
-                    || /markitems\/(small_potion|great_potion|ultra_potion|hyper_potion|ultimate_potion)\.png/.test(src);
-            }
-        },
-        {
-            id: 'revives',
-            label: '✨ Revives',
-            match: (name, alt, iconSrc) => {
-                const n = (name || alt || '').toLowerCase();
-                const src = (iconSrc || '').toLowerCase();
-                return /\brevive\b|\brevives\b/.test(n)
-                    || /markitems\/(revive|max_revive)\.png/.test(src);
-            }
-        }
+        { id: 'balls',   label: '🔴 Poké Bolas' },
+        { id: 'potions', label: '💊 Poções' },
+        { id: 'revives', label: '✨ Revives' }
     ];
 
-    function categorizeItem(name, alt, iconSrc) {
-        for (const cat of INVENTORY_CATEGORIES) {
-            if (cat.match(name, alt, iconSrc)) return cat.id;
-        }
+    function categorizeByName(name) {
+        const n = String(name || '').toLowerCase();
+        if (/\b(pok[eé]\s*ball|great\s*ball|super\s*ball|ultra\s*ball|idle\s*ball|master\s*ball|golden\s*idle\s*ball)\b/.test(n)) return 'balls';
+        if (/\bpotion\b/.test(n)) return 'potions';
+        if (/\brevive\b/.test(n)) return 'revives';
         return null;
     }
 
-    // --- Leitura via DOM (fallback) ---
-    function readInventoryFromDOM() {
-        const grid = document.querySelector('.inv-grid');
-        if (!grid) return null;
+    function loadItemCatalog() {
+        if (globalItemApiData.size) return Promise.resolve(globalItemApiData);
+        return fetch(ITEMS_JSON_URL)
+            .then(response => response.ok ? response.json() : null)
+            .then(payload => {
+                if (!payload) return globalItemApiData;
+                const list = Array.isArray(payload) ? payload : (payload.items || []);
+                list.forEach(item => {
+                    if (!item || typeof item !== 'object') return;
+                    const id = String(item.id ?? item.key ?? '').trim();
+                    const name = (item.name || item.title || '').trim();
+                    if (id) globalItemApiData.set(id, item);
+                    if (name) globalItemApiData.set(name.toLowerCase(), item);
+                });
+                return globalItemApiData;
+            })
+            .catch(() => globalItemApiData);
+    }
 
+    // === Fallback DOM ===
+    function readInventoryFromGrid() {
+        const grid = document.querySelector('.inv-grid');
+        if (!grid) return [];
         const entries = [];
         grid.querySelectorAll('.inv-slot').forEach(slot => {
             if (slot.classList.contains('empty')) return;
             if (slot.classList.contains('inv-poke')) return;
-
-            const img = slot.querySelector('img.inv-ico, img.poke-icon-img, img');
+            const img = slot.querySelector('img.inv-ico, img');
             if (!img) return;
-
             const alt = (img.getAttribute('alt') || '').trim();
             const title = (slot.getAttribute('title') || '').trim();
             const name = alt || title.split('—')[0].trim();
             if (!name) return;
-
+            const cat = categorizeByName(name);
+            if (!cat) return;
             const iconSrc = img.getAttribute('src') || '';
             const qtyEl = slot.querySelector('.inv-qty');
-            const qtyText = (qtyEl?.textContent || '').trim();
-            const qty = qtyText ? (parseInt(qtyText.replace(/[^0-9]/g, ''), 10) || 1) : 1;
-
-            entries.push({ name, alt, title, iconSrc, qty });
+            const qty = qtyEl ? (parseInt((qtyEl.textContent || '').replace(/[^0-9]/g, ''), 10) || 1) : 1;
+            entries.push({ name, iconSrc, qty, cat });
         });
         return entries;
     }
-
-    // --- Leitura via API (tempo real) ---
-    async function fetchInventoryFromAPI() {
-        const payload = await gameApiRequest(INVENTORY_API_URL);
-        const items = Array.isArray(payload) ? payload
-                    : (payload?.items || payload?.inventory || []);
-        await loadItemCatalog();
-
+    function readInventoryFromAutoHelper() {
+        const ahModal = document.querySelector('.ah-modal');
+        if (!ahModal) return [];
         const entries = [];
-        items.forEach(entry => {
-            if (!entry) return;
-            const itemId = String(entry.itemId ?? entry.id ?? entry.item_id ?? '').trim();
-            const qty = Number(entry.quantity ?? entry.qty ?? entry.amount ?? 0);
-            if (!itemId || qty <= 0) return;
-
-            const catalog = globalItemCatalog.get(itemId);
-            const name = catalog?.name || entry.name || entry.title || `Item ${itemId}`;
-            const iconRaw = catalog?.icon || entry.icon || entry.image || '';
-            const iconSrc = iconRaw ? normalizeGameItemIcon(iconRaw) : '';
-            entries.push({ name, alt: name, title: name, iconSrc, qty, itemId });
+        const seen = new Set();
+        ahModal.querySelectorAll('.cap-chip').forEach(chip => {
+            const title = (chip.getAttribute('title') || '').trim();
+            const img = chip.querySelector('img.cap-chip-ico');
+            const alt = (img?.getAttribute('alt') || '').trim();
+            const name = title || alt;
+            if (!name) return;
+            const nEl = chip.querySelector('.cap-chip-n');
+            const qtyText = (nEl?.textContent || '').trim();
+            const qty = qtyText ? (parseInt(qtyText.replace(/[^0-9]/g, ''), 10) || 0) : 0;
+            const iconSrc = img?.getAttribute('src') || '';
+            const key = `ball:${name.toLowerCase()}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            entries.push({ name, iconSrc, qty, cat: 'balls' });
+        });
+        ahModal.querySelectorAll('select.ah-sel').forEach(sel => {
+            sel.querySelectorAll('option').forEach(opt => {
+                const text = (opt.textContent || '').trim();
+                if (!/potion/i.test(text)) return;
+                const match = text.match(/^(.+?)\s*[×x]\s*([\d.,]+)\s*$/i);
+                if (!match) return;
+                const rawName = match[1].trim();
+                const rawQty = match[2].replace(/\./g, '').replace(',', '.');
+                const qty = Math.round(Number(rawQty)) || 0;
+                const iconSrc = findIconForItemName(ahModal, rawName)
+                    || `/assets/markitems/${rawName.toLowerCase().replace(/\s+/g, '_')}.png`;
+                const key = `potion:${rawName.toLowerCase()}`;
+                if (seen.has(key)) return;
+                seen.add(key);
+                entries.push({ name: rawName, iconSrc, qty, cat: 'potions' });
+            });
+        });
+        ahModal.querySelectorAll('img').forEach(img => {
+            const src = (img.getAttribute('src') || '').toLowerCase();
+            if (!/revive/.test(src)) return;
+            const alt = (img.getAttribute('alt') || '').trim();
+            const name = alt || (/max_revive/.test(src) ? 'Max Revive' : 'Revive');
+            const key = `revive:${name.toLowerCase()}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            entries.push({ name, iconSrc: img.getAttribute('src') || '', qty: 0, cat: 'revives' });
         });
         return entries;
     }
-
-    // --- Agrupamento ---
-    function groupInventory(entries) {
+    function findIconForItemName(root, name) {
+        const wanted = normalizePokemonName(name);
+        const imgs = Array.from(root.querySelectorAll('img'));
+        for (const img of imgs) {
+            const alt = normalizePokemonName(img.getAttribute('alt') || '');
+            if (alt === wanted) return img.getAttribute('src') || '';
+            const src = (img.getAttribute('src') || '').toLowerCase();
+            const slug = wanted.replace(/\s+/g, '_');
+            if (src.includes(slug)) return img.getAttribute('src') || '';
+        }
+        return '';
+    }
+    function groupEntries(entries) {
         const grouped = { balls: [], potions: [], revives: [] };
         (entries || []).forEach(entry => {
-            const cat = categorizeItem(entry.name, entry.alt, entry.iconSrc);
-            if (cat) grouped[cat].push(entry);
+            if (!entry || !entry.cat) return;
+            if (entry.qty <= 0 && entry.cat !== 'revives') return;
+            grouped[entry.cat].push(entry);
         });
         Object.keys(grouped).forEach(key => {
             grouped[key].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
@@ -1130,7 +1282,6 @@
         return grouped;
     }
 
-    // --- Render do painel ---
     function ensureInventoryPanel() {
         let panel = document.getElementById('script-inv-panel');
         if (panel) return panel;
@@ -1141,40 +1292,77 @@
         panel.innerHTML = `
             <button id="script-inv-toggle" type="button" title="Mostrar/ocultar inventário"
                 style="background:transparent;border:0;color:#ffcc00;font-size:18px;font-weight:bold;width:40px;height:36px;border-radius:8px;cursor:pointer;">🎒</button>
+            <button id="script-inv-refresh" type="button" title="Forçar atualização"
+                style="background:transparent;border:0;color:#63b3ed;font-size:16px;font-weight:bold;width:40px;height:32px;border-radius:8px;cursor:pointer;">🔄</button>
             <div id="script-inv-body" style="display:none;width:230px;max-height:70vh;overflow-y:auto;padding-right:2px;">
+                <div id="script-inv-live" style="font-size:10px;color:#a0aec0;padding:2px 4px 6px;text-align:right;"></div>
                 <div id="script-inv-content"></div>
             </div>
         `;
         document.body.appendChild(panel);
 
         const toggleBtn = panel.querySelector('#script-inv-toggle');
+        const refreshBtn = panel.querySelector('#script-inv-refresh');
         const body = panel.querySelector('#script-inv-body');
         const open = localStorage.getItem(STORAGE_INV_PANEL_OPEN) === 'true';
         body.style.display = open ? 'block' : 'none';
         toggleBtn.style.color = open ? '#ffcc00' : '#a0aec0';
+
+        refreshBtn.addEventListener('click', () => {
+            requestInventoryFromGame();
+            requestBallsFromGame();
+            refreshBtn.style.opacity = '0.4';
+            setTimeout(() => { refreshBtn.style.opacity = '1'; }, 500);
+        });
 
         toggleBtn.addEventListener('click', () => {
             const isOpen = body.style.display !== 'none';
             body.style.display = isOpen ? 'none' : 'block';
             toggleBtn.style.color = isOpen ? '#a0aec0' : '#ffcc00';
             localStorage.setItem(STORAGE_INV_PANEL_OPEN, String(!isOpen));
-            if (!isOpen) refreshInventoryPanel();
+            if (!isOpen) {
+                // abre o painel: renderiza o cache atual + pede inventário na hora
+                renderInventoryContent();
+                requestInventoryFromGame();
+                requestBallsFromGame();
+                // fallback DOM só se nada chegar em 1,5s
+                setTimeout(() => {
+                    const age = Date.now() - inventoryLastLiveAt;
+                    if (age > 1500) {
+                        const domEntries = [...readInventoryFromGrid(), ...readInventoryFromAutoHelper()];
+                        if (domEntries.length) {
+                            mergeIntoInventoryCache(groupEntries(domEntries));
+                            inventoryLastLiveAt = Date.now();
+                            renderInventoryContent();
+                        }
+                    }
+                }, 1500);
+            }
         });
 
         return panel;
     }
 
-    function renderInventoryContent(grouped) {
+    function renderInventoryContent() {
         const panel = ensureInventoryPanel();
         const content = panel.querySelector('#script-inv-content');
+        const liveEl = panel.querySelector('#script-inv-live');
 
-        const signature = JSON.stringify(grouped);
+        const ageMs = Date.now() - inventoryLastLiveAt;
+        const isLive = ageMs < 20000;
+        const when = inventoryLastLiveAt
+            ? new Date(inventoryLastLiveAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+            : '—';
+        liveEl.textContent = `${isLive ? '● ao vivo' : '○ cache'} · ${when}`;
+        liveEl.style.color = isLive ? '#48bb78' : '#a0aec0';
+
+        const signature = JSON.stringify(inventoryCache);
         if (signature === lastInventorySignature && content.childElementCount) return;
         lastInventorySignature = signature;
 
         let html = '';
         for (const cat of INVENTORY_CATEGORIES) {
-            const items = grouped[cat.id] || [];
+            const items = inventoryCache[cat.id] || [];
             html += `<div style="margin-bottom:8px;">
                 <div style="font-weight:800;font-size:12px;color:#d9c38c;border-bottom:1px solid #3a2c17;padding:4px 2px;margin-bottom:4px;">${cat.label}</div>`;
             if (!items.length) {
@@ -1197,88 +1385,59 @@
         content.innerHTML = html;
     }
 
-    async function refreshInventoryPanel() {
-        const panel = ensureInventoryPanel();
-        const body = panel.querySelector('#script-inv-body');
-        if (body.style.display === 'none') return;
-
-        if (inventoryFetchInFlight) return;
-        inventoryFetchInFlight = true;
-
-        try {
-            const entries = await fetchInventoryFromAPI();
-            renderInventoryContent(groupInventory(entries));
-        } catch (error) {
-            // Fallback: DOM
-            const domEntries = readInventoryFromDOM();
-            if (domEntries) {
-                renderInventoryContent(groupInventory(domEntries));
-            } else {
-                const content = panel.querySelector('#script-inv-content');
-                content.innerHTML = '<div style="padding:8px;color:#a0aec0;font-size:12px;text-align:center;">Não foi possível carregar o inventário.</div>';
-            }
-        } finally {
-            inventoryFetchInFlight = false;
-        }
-    }
-
-    function startInventoryAutoRefresh() {
-        if (inventoryRefreshTimer) clearInterval(inventoryRefreshTimer);
-        inventoryRefreshTimer = setInterval(() => {
+    function scheduleInventoryPanelRefresh() {
+        if (inventoryRenderTimeout) return;
+        inventoryRenderTimeout = setTimeout(() => {
+            inventoryRenderTimeout = null;
             const panel = document.getElementById('script-inv-panel');
             if (!panel) return;
             const body = panel.querySelector('#script-inv-body');
-            if (body && body.style.display !== 'none') refreshInventoryPanel();
-        }, INVENTORY_REFRESH_INTERVAL_MS);
+            if (body && body.style.display !== 'none') renderInventoryContent();
+        }, 80);
+    }
+
+    async function refreshInventoryData() {
+        if (gameContext) {
+            requestInventoryFromGame();
+            return;
+        }
+        const domEntries = [...readInventoryFromGrid(), ...readInventoryFromAutoHelper()];
+        if (domEntries.length) {
+            mergeIntoInventoryCache(groupEntries(domEntries));
+            inventoryLastLiveAt = Date.now();
+        } else {
+            inventoryCache = loadInventoryCacheFromStorage();
+        }
+    }
+
+    function refreshInventoryPanel() {
+        const panel = ensureInventoryPanel();
+        const body = panel.querySelector('#script-inv-body');
+        if (body.style.display === 'none') return;
+        refreshInventoryData().finally(renderInventoryContent);
+    }
+
+    function startInventoryAutoRefresh() {
+        if (inventoryHeartbeatTimer) clearInterval(inventoryHeartbeatTimer);
+        inventoryHeartbeatTimer = setInterval(() => {
+            try {
+                if (gameContext) requestInventoryFromGame();
+            } catch (e) { /* nunca deixa o timer morrer */ }
+        }, INVENTORY_HEARTBEAT_MS);
+
+        if (inventoryRefreshTimer) clearInterval(inventoryRefreshTimer);
+        inventoryRefreshTimer = setInterval(() => {
+            try {
+                const panel = document.getElementById('script-inv-panel');
+                if (!panel) return;
+                const body = panel.querySelector('#script-inv-body');
+                if (body && body.style.display !== 'none') renderInventoryContent();
+            } catch (e) { /* nunca deixa o timer morrer */ }
+        }, INVENTORY_RENDER_MS);
     }
 
     // ============================================================
-    // 17) PATCH DO WEBSOCKET — refresh imediato em eventos de item
-    // ============================================================
-    function patchWebSocketForInventory() {
-        const NativeWebSocket = window.WebSocket;
-        if (!NativeWebSocket || NativeWebSocket.__piwQolPatched) return;
-        NativeWebSocket.__piwQolPatched = true;
-
-        const originalAddEventListener = NativeWebSocket.prototype.addEventListener;
-        // Não interceptamos mensagens diretamente; usamos um listener global via patch de send/receive
-        // para pegar eventos como "inventory", "item-used", "ball-used", "potion-used".
-
-        function handleGameMessage(message) {
-            if (!message || typeof message !== 'object') return;
-            const type = String(message.type || '').toLowerCase();
-            if (/inventory|item|ball|potion|revive|use|heal|sell|buy|drop/.test(type)) {
-                // Re-consulta a API logo em seguida
-                setTimeout(() => {
-                    const panel = document.getElementById('script-inv-panel');
-                    if (!panel) return;
-                    const body = panel.querySelector('#script-inv-body');
-                    if (body && body.style.display !== 'none') refreshInventoryPanel();
-                }, 300);
-            }
-        }
-
-        // Patch do construtor WebSocket
-        const OriginalWebSocket = window.WebSocket;
-        function PatchedWebSocket(url, protocols) {
-            const socket = protocols === undefined
-                ? new OriginalWebSocket(url)
-                : new OriginalWebSocket(url, protocols);
-            socket.addEventListener('message', event => {
-                try {
-                    const data = JSON.parse(event.data);
-                    handleGameMessage(data);
-                } catch { /* ignore */ }
-            });
-            return socket;
-        }
-        PatchedWebSocket.prototype = OriginalWebSocket.prototype;
-        Object.setPrototypeOf(PatchedWebSocket, OriginalWebSocket);
-        window.WebSocket = PatchedWebSocket;
-    }
-
-    // ============================================================
-    // 18) TOOLTIP / NOTIFICAÇÕES / BOTÃO DE NAVEGAÇÃO
+    // 12) TOOLTIP / NOTIFICAÇÕES / BOTÃO DE NAVEGAÇÃO
     // ============================================================
     function showDropTooltip(e, dropsHTML) {
         hideDropTooltip();
@@ -1359,16 +1518,14 @@
     }
 
     // ============================================================
-    // 19) ESTILO
+    // 13) ESTILO
     // ============================================================
     const styleMapMod = document.createElement('style');
     styleMapMod.id = 'simplifier-map-override';
     styleMapMod.innerHTML = `
-        /* Esconde apenas o mapa gráfico; preserva busca, abas e filtros nativos */
         .map-viewport, .map-img, .map-zoom { display: none !important; }
         .hunt-marker { opacity: 0 !important; position: absolute !important; pointer-events: none !important; }
 
-        /* Corpo do mapa: respiro consistente */
         .map-window .map-body {
             padding: 10px 14px 14px !important;
             display: flex !important;
@@ -1378,7 +1535,6 @@
             overflow: hidden !important;
         }
 
-        /* Busca nativa */
         .map-window .map-filters {
             display: flex !important;
             align-items: center !important;
@@ -1414,7 +1570,6 @@
             border-radius: 6px !important;
         }
 
-        /* Abas de região — ícones maiores, mesma linha */
         .map-window .map-areas {
             display: flex !important;
             gap: 8px !important;
@@ -1458,7 +1613,6 @@
         }
         .map-window .map-plate.locked { opacity: .5 !important; }
 
-        /* Botão "Cidades" — mesmo tamanho visual das abas */
         .map-window .map-areas .script-city-area {
             width: 110px !important;
             height: 68px !important;
@@ -1487,10 +1641,8 @@
             box-shadow: 0 0 0 2px rgba(159,123,53,.45) !important;
         }
 
-        /* Barra de tipos nativa (escondida) */
         .map-window .script-hidden-native-types { display: none !important; }
 
-        /* Barra de filtros do script */
         #custom-hunts-filter-bar {
             display: grid !important;
             grid-template-columns: minmax(175px,1.4fr) minmax(115px,1fr) minmax(145px,1fr) !important;
@@ -1510,7 +1662,6 @@
             outline: none !important;
         }
 
-        /* Container da lista */
         #simple-hunts-container {
             flex: 1 1 auto !important;
             min-height: 0 !important;
@@ -1545,12 +1696,10 @@
     appendStyleWhenReady(styleMapMod);
 
     // ============================================================
-    // 20) INICIALIZAÇÃO
+    // 14) INICIALIZAÇÃO
     // ============================================================
-    const observer = new MutationObserver(() => {
-        if (renderTimeout) return;
-        renderTimeout = setTimeout(() => {
-            renderTimeout = null;
+    function onDomChanged() {
+        try {
             injectQuickTPButton();
             if (document.querySelector('.map-window')) {
                 refreshLeaderFromHud();
@@ -1562,42 +1711,63 @@
                 }
                 buildSimpleList();
             }
-            if (document.querySelector('.inv-grid')) {
-                if (inventoryRenderTimeout) clearTimeout(inventoryRenderTimeout);
-                inventoryRenderTimeout = setTimeout(() => {
-                    inventoryRenderTimeout = null;
-                    refreshInventoryPanel();
-                }, 150);
-            }
-        }, 200);
+            ensureInventoryPanel();
+            renderInventoryContent();
+            if (!gameContext) waitForGameContext();
+        } catch (e) {
+            console.error('[PIW-QOL] Erro no observer:', e);
+        }
+    }
+
+    const observer = new MutationObserver(() => {
+        if (observerDebounceTimer) return;
+        observerDebounceTimer = setTimeout(() => {
+            observerDebounceTimer = null;
+            onDomChanged();
+        }, 300);
     });
 
     function initialize() {
-        patchWebSocketForInventory();
-        loadItemCatalog();
-        loadExternalPokemonData();
-        loadMapMarkersData();
-        loadTrainerLevel(true);
-        refreshLeaderFromHud();
-        applyMapScriptState();
-        ensureInventoryPanel();
-        startInventoryAutoRefresh();
-        observer.observe(document.body, { childList: true, subtree: true });
+        try {
+            loadExternalPokemonData();
+            loadMapMarkersData();
+            loadItemCatalog();
+            loadTrainerLevel(true);
+            refreshLeaderFromHud();
+            applyMapScriptState();
+            ensureInventoryPanel();
+            startInventoryAutoRefresh();
+            observer.observe(document.body, { childList: true, subtree: true });
 
-        setInterval(() => {
-            const changed = refreshLeaderFromHud();
-            loadTrainerLevel(true).then(() => {
-                if (changed || document.querySelector('.map-window')) {
-                    lastMapRenderSignature = '';
-                    if (document.querySelector('.map-window')) buildSimpleList();
+            waitForGameContext().then(ctx => {
+                if (ctx) {
+                    console.info('[PIW-QOL] gameContext encontrado. Inventário em tempo real ativo.');
+                    requestInventoryFromGame();
+                    setTimeout(() => requestInventoryFromGame(), 1000);
+                    setTimeout(() => requestInventoryFromGame(), 3000);
+                } else {
+                    console.warn('[PIW-QOL] gameContext não encontrado — usando DOM como fallback.');
                 }
             });
-            if (document.querySelector('.inv-grid')) refreshInventoryPanel();
-        }, 10000);
 
-        // Primeira carga do painel
-        refreshInventoryPanel();
+            setInterval(() => {
+                try {
+                    const changed = refreshLeaderFromHud();
+                    loadTrainerLevel(true).then(() => {
+                        if (changed || document.querySelector('.map-window')) {
+                            lastMapRenderSignature = '';
+                            if (document.querySelector('.map-window')) buildSimpleList();
+                        }
+                    });
+                } catch (e) { /* nunca deixa o timer morrer */ }
+            }, 5000);
+
+            refreshInventoryData().finally(renderInventoryContent);
+        } catch (e) {
+            console.error('[PIW-QOL] Erro na inicialização:', e);
+        }
     }
+
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', initialize, { once: true });
     } else {
@@ -1605,10 +1775,12 @@
     }
 
     document.addEventListener('click', event => {
-        if (event.target.closest('.map-plate:not(.script-city-area), .map-area:not(.script-city-area)')) {
-            lastMapRenderSignature = '';
-            setTimeout(() => buildSimpleList(), 250);
-        }
+        try {
+            if (event.target.closest('.map-plate:not(.script-city-area), .map-area:not(.script-city-area)')) {
+                lastMapRenderSignature = '';
+                setTimeout(() => buildSimpleList(), 250);
+            }
+        } catch (e) { /* ignore */ }
     }, true);
 
 })();
