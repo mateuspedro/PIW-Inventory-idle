@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PIW — Mapa Simplificado + Inventário em tempo real
 // @namespace    http://tampermonkey.net/
-// @version      1.6.3
+// @version      1.7.2
 // @description  Lista simplificada de hunts + painel de inventário lido via API interna do jogo (React context).
 // @author       KizaniN
 // @match        https://poke.idleworld.online/play
@@ -18,6 +18,8 @@
     const STORAGE_SCRIPT_ACTIVE    = 'script_mapa_ativo_v1';
     const STORAGE_FAVS             = 'hunts_favoritas_v1';
     const STORAGE_LAST_HUNT        = 'ultima_hunt_v1';
+    const STORAGE_CURRENT_HUNT     = 'script_current_hunt_v1';
+    const STORAGE_LAST_DUNGEON     = 'script_last_dungeon_v1';
     const STORAGE_DROP_MODE        = 'script_drop_mode_v1';
     const STORAGE_NAV_MODE         = 'script_nav_tp_mode_v1';
     const STORAGE_PRIMARY_FAVORITE = 'script_primary_favorite_v1';
@@ -66,7 +68,7 @@
     let inventoryLastLiveAt = 0;
 
     // ============================================================
-    // 2) GAME CONTEXT (React context do jogo)
+    // 2) GAME CONTEXT
     // ============================================================
     function findGameContextFromDOM() {
         const hudElement = document.querySelector('.phud-name') || document.querySelector('.phud');
@@ -106,7 +108,6 @@
     function subscribeToInventory() {
         if (!gameContext) return;
 
-        // 1) Evento inventory (poções, revives, stones, etc.)
         if (!inventorySubscription) {
             try {
                 inventorySubscription = gameContext.subscribe('inventory', message => {
@@ -122,7 +123,6 @@
             }
         }
 
-        // 2) Evento balls (Pokébolas — vêm separadas)
         if (!ballsSubscription) {
             try {
                 ballsSubscription = gameContext.subscribe('balls', message => {
@@ -131,7 +131,7 @@
                     if (!catalog.length) return;
                     const entries = catalog.map(ball => {
                         const qty = Number(counts[String(ball.id)] ?? 0);
-                        if (qty <= 0) return null;
+                        if (qty <= 1) return null;
                         return {
                             name: ball.name,
                             iconSrc: ball.iconUrl || '',
@@ -149,14 +149,13 @@
             }
         }
 
-        // 3) Eventos que costumam mudar o inventário
         ['field-kill', 'catch-result', 'poke-xp', 'item-use', 'ball-use', 'potion-use', 'revive', 'shop-buy']
             .forEach(type => {
                 try {
                     gameContext.subscribe(type, () => {
                         setTimeout(() => requestInventoryFromGame(), 400);
                     });
-                } catch { /* tipo pode não existir, ignora */ }
+                } catch { /* tipo pode não existir */ }
             });
     }
 
@@ -188,7 +187,7 @@
         (items || []).forEach(entry => {
             const itemId = String(entry?.itemId ?? '').trim();
             const qty = Number(entry?.quantity ?? 0);
-            if (!itemId || qty <= 0) return;
+            if (!itemId || !Number.isFinite(qty) || qty <= 1) return;
             const catalog = globalItemApiData.get(itemId);
             const name = catalog?.name || catalog?.title || `Item ${itemId}`;
             const cat = categorizeByName(name);
@@ -295,6 +294,7 @@
                 }
             });
             inventoryCache[cat] = Array.from(byName.values())
+                .filter(e => Number(e.qty) > 1)
                 .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
         }
         if (changed) saveInventoryCacheToStorage();
@@ -367,12 +367,32 @@
         return `--city-badge:"${badge}";width:38px;height:38px;`;
     }
 
-    function getFavorites() { return readStoredJSON(STORAGE_FAVS, []); }
-    function saveLastHunt(huntName) {
-        if (huntName && huntName !== 'Sem Nome' && !isCityName(huntName))
-            localStorage.setItem(STORAGE_LAST_HUNT, huntName);
+    // ============================================================
+    // ÚLTIMA HUNT vs HUNT ATUAL
+    //   STORAGE_CURRENT_HUNT = hunt onde o personagem está agora
+    //   STORAGE_LAST_HUNT    = hunt ANTERIOR (a que ele saiu)
+    // ============================================================
+    function getCurrentHunt() {
+        return localStorage.getItem(STORAGE_CURRENT_HUNT) || null;
     }
-    function getLastHunt() { return localStorage.getItem(STORAGE_LAST_HUNT) || null; }
+    function setCurrentHunt(huntName) {
+        if (!huntName || huntName === 'Sem Nome' || isCityName(huntName)) return;
+        const clean = String(huntName).trim();
+        const previous = getCurrentHunt();
+        if (previous === clean) return;           // nada mudou
+        if (previous) {
+            // A hunt anterior vira "última hunt"
+            localStorage.setItem(STORAGE_LAST_HUNT, previous);
+        }
+        localStorage.setItem(STORAGE_CURRENT_HUNT, clean);
+    }
+    function getLastHunt() {
+        return localStorage.getItem(STORAGE_LAST_HUNT) || null;
+    }
+    // compatibilidade com o resto do código
+    function saveLastHunt(huntName) { setCurrentHunt(huntName); }
+
+    function getFavorites() { return readStoredJSON(STORAGE_FAVS, []); }
     function getPrimaryFavorite() {
         const favorite = localStorage.getItem(STORAGE_PRIMARY_FAVORITE);
         return getFavorites().includes(favorite) ? favorite : null;
@@ -388,6 +408,25 @@
         lastMapRenderSignature = '';
         updateNavButtonAppearance();
         buildSimpleList();
+    }
+
+    // ---- Dungeon salva ----
+    function getLastDungeon() {
+        try {
+            const raw = localStorage.getItem(STORAGE_LAST_DUNGEON);
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            return parsed && parsed.name ? parsed : null;
+        } catch { return null; }
+    }
+    function saveLastDungeon(name, slug) {
+        if (!name || isCityName(name)) return;
+        const clean = String(name).trim();
+        if (!clean || clean === 'Sem Nome') return;
+        const current = getLastDungeon();
+        if (current && current.name === clean && current.slug === slug) return;
+        localStorage.setItem(STORAGE_LAST_DUNGEON, JSON.stringify({ name: clean, slug: slug || null, savedAt: Date.now() }));
+        updateDungeonButtonAppearance();
     }
 
     function getDropMode() { return localStorage.getItem(STORAGE_DROP_MODE) || 'icon'; }
@@ -956,7 +995,13 @@
                 const city = isCityMarker(marker, name);
                 const canAccess = city || trainerLevel >= requiredLevel;
                 const isHere = marker.classList.contains('here');
-                if (isHere && !city) saveLastHunt(name);
+                if (isHere && !city) {
+                    // Registra a hunt atual; a anterior vira "última hunt"
+                    setCurrentHunt(name);
+                    const apiMarker = findMappedHunt(name);
+                    const slug = apiMarker ? getMarkerSlug(apiMarker) : null;
+                    saveLastDungeon(name, slug);
+                }
                 const details = extractHuntDetailsFromJSON(name, marker);
                 const defenderTypes = getDefenderTypes(name);
                 const effectiveness = getOffensiveMultiplier(activePkmnTypes, defenderTypes);
@@ -1050,8 +1095,21 @@
                 return a.name.localeCompare(b.name);
             });
 
+            // Ordem final: [Aqui] > [Última Hunt] > resto
+            const lastHuntName = getLastHunt();
+            const currentHereIndex = huntDataList.findIndex(h => h.isHere);
+            if (currentHereIndex > 0) {
+                huntDataList.unshift(huntDataList.splice(currentHereIndex, 1)[0]);
+            }
+            if (lastHuntName && viewMode === 'hunts') {
+                const lastIndex = huntDataList.findIndex((h, idx) =>
+                    !h.isHere && getCleanHuntName(h.name) === getCleanHuntName(lastHuntName));
+                if (lastIndex > 0) huntDataList.unshift(huntDataList.splice(lastIndex, 1)[0]);
+            }
+
             const renderSignature = JSON.stringify({
                 sortVal, selectedType, accessFilter, trainerLevel, favorites, viewMode, activePkmn, activeRegion,
+                lastHunt: lastHuntName,
                 rows: huntDataList.map(h => [h.name, h.lvlText, h.canAccess, h.isHere, h.numericPrice, h.effectiveness])
             });
             if (renderSignature === lastMapRenderSignature && simpleContainer.childElementCount) { isRendering = false; return; }
@@ -1065,12 +1123,13 @@
 
             huntDataList.forEach(hunt => {
                 const isFav = favorites.includes(hunt.name);
+                const isLast = !hunt.isHere && lastHuntName && getCleanHuntName(hunt.name) === getCleanHuntName(lastHuntName);
                 const row = document.createElement('div');
                 row.style = `
                     display:flex; align-items:center; justify-content:space-between;
                     padding:10px 14px; margin-bottom:8px;
-                    background: ${!hunt.canAccess ? '#25191d' : (hunt.isHere ? '#163126' : (isFav ? '#282116' : '#14222d'))};
-                    border-left: 4px solid ${!hunt.canAccess ? '#e05252' : (hunt.isHere ? '#4caf50' : (isFav ? '#f6c453' : '#273f52'))};
+                    background: ${!hunt.canAccess ? '#25191d' : (hunt.isHere ? '#163126' : (isLast ? '#2a1a3a' : (isFav ? '#282116' : '#14222d')))};
+                    border-left: 4px solid ${!hunt.canAccess ? '#e05252' : (hunt.isHere ? '#4caf50' : (isLast ? '#a855f7' : (isFav ? '#f6c453' : '#273f52')))};
                     border-radius:4px; color:#e2e8f0; font-size:14px;
                     cursor:${hunt.canAccess ? 'pointer' : 'not-allowed'}; opacity:${hunt.canAccess ? '1' : '.72'};
                 `;
@@ -1107,6 +1166,7 @@
                         ${hunt.city ? '' : `<span style="font-size:12px;font-weight:950;padding:4px 9px;border-radius:999px;border:1px solid currentColor;color:${hunt.effectiveness > 1 ? '#9cffb2' : hunt.effectiveness < 1 ? '#ff9b9b' : '#cbd5e0'};background:${hunt.effectiveness > 1 ? '#123d25' : hunt.effectiveness < 1 ? '#481d24' : '#293746'};">${hunt.effectiveness}x</span>`}
                         ${hunt.city ? '' : typeBadges}
                         ${hunt.isHere ? '<span style="font-size:11px;color:#4caf50;font-weight:bold;">[Aqui]</span>' : ''}
+                        ${isLast ? '<span style="font-size:11px;color:#c084fc;font-weight:bold;">[Última Hunt]</span>' : ''}
                         ${!hunt.canAccess ? `<span style="font-size:11px;color:#ff8b8b;background:#3b2026;border:1px solid #71313c;padding:2px 6px;border-radius:4px;">🔒 Nv ${hunt.requiredLevel}</span>` : ''}
                     </div>
                     ${hunt.city ? '' : `<div style="font-size:12px;color:#48bb78;margin-top:3px;">${hunt.sellsFor !== 'Indisponível' ? `Valor: ${hunt.sellsFor}` : ''} ${hunt.expText ? `<span style="color:#ed8936;margin-left:8px;">${hunt.expText}</span>` : ''}</div>`}
@@ -1119,7 +1179,7 @@
                         showScriptNotice(`Esta hunt exige nível ${hunt.requiredLevel}. Seu nível é ${trainerLevel}.`, { title: 'Hunt bloqueada' });
                         return;
                     }
-                    saveLastHunt(hunt.name);
+                    // NÃO chama setCurrentHunt aqui — deixa o mapa detectar o [Aqui] quando chegar
                     teleportToTarget(hunt.name);
                 });
 
@@ -1203,7 +1263,8 @@
             if (!cat) return;
             const iconSrc = img.getAttribute('src') || '';
             const qtyEl = slot.querySelector('.inv-qty');
-            const qty = qtyEl ? (parseInt((qtyEl.textContent || '').replace(/[^0-9]/g, ''), 10) || 1) : 1;
+            const qty = qtyEl ? (parseInt((qtyEl.textContent || '').replace(/[^0-9]/g, ''), 10) || 0) : 0;
+            if (qty <= 1) return;
             entries.push({ name, iconSrc, qty, cat });
         });
         return entries;
@@ -1222,6 +1283,7 @@
             const nEl = chip.querySelector('.cap-chip-n');
             const qtyText = (nEl?.textContent || '').trim();
             const qty = qtyText ? (parseInt(qtyText.replace(/[^0-9]/g, ''), 10) || 0) : 0;
+            if (qty <= 1) return;
             const iconSrc = img?.getAttribute('src') || '';
             const key = `ball:${name.toLowerCase()}`;
             if (seen.has(key)) return;
@@ -1237,6 +1299,7 @@
                 const rawName = match[1].trim();
                 const rawQty = match[2].replace(/\./g, '').replace(',', '.');
                 const qty = Math.round(Number(rawQty)) || 0;
+                if (qty <= 1) return;
                 const iconSrc = findIconForItemName(ahModal, rawName)
                     || `/assets/markitems/${rawName.toLowerCase().replace(/\s+/g, '_')}.png`;
                 const key = `potion:${rawName.toLowerCase()}`;
@@ -1244,16 +1307,6 @@
                 seen.add(key);
                 entries.push({ name: rawName, iconSrc, qty, cat: 'potions' });
             });
-        });
-        ahModal.querySelectorAll('img').forEach(img => {
-            const src = (img.getAttribute('src') || '').toLowerCase();
-            if (!/revive/.test(src)) return;
-            const alt = (img.getAttribute('alt') || '').trim();
-            const name = alt || (/max_revive/.test(src) ? 'Max Revive' : 'Revive');
-            const key = `revive:${name.toLowerCase()}`;
-            if (seen.has(key)) return;
-            seen.add(key);
-            entries.push({ name, iconSrc: img.getAttribute('src') || '', qty: 0, cat: 'revives' });
         });
         return entries;
     }
@@ -1273,7 +1326,7 @@
         const grouped = { balls: [], potions: [], revives: [] };
         (entries || []).forEach(entry => {
             if (!entry || !entry.cat) return;
-            if (entry.qty <= 0 && entry.cat !== 'revives') return;
+            if (!Number.isFinite(entry.qty) || entry.qty <= 1) return;
             grouped[entry.cat].push(entry);
         });
         Object.keys(grouped).forEach(key => {
@@ -1290,10 +1343,12 @@
         panel.id = 'script-inv-panel';
         panel.style = 'position:fixed;right:8px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:6px;background:rgba(20,16,10,.88);border:2px solid rgb(120,90,40);border-radius:10px;padding:8px 6px;z-index:9000;max-height:80vh;overflow:hidden;font-family:sans-serif;color:#e2e8f0;';
         panel.innerHTML = `
-            <button id="script-inv-toggle" type="button" title="Mostrar/ocultar inventário"
-                style="background:transparent;border:0;color:#ffcc00;font-size:18px;font-weight:bold;width:40px;height:36px;border-radius:8px;cursor:pointer;">🎒</button>
-            <button id="script-inv-refresh" type="button" title="Forçar atualização"
-                style="background:transparent;border:0;color:#63b3ed;font-size:16px;font-weight:bold;width:40px;height:32px;border-radius:8px;cursor:pointer;">🔄</button>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;width:100%;">
+                <button id="script-inv-toggle" type="button" title="Mostrar/ocultar inventário"
+                    style="background:transparent;border:0;color:#ffcc00;font-size:18px;font-weight:bold;width:36px;height:32px;border-radius:8px;cursor:pointer;flex:0 0 auto;">🎒</button>
+                <button id="script-inv-refresh" type="button" title="Forçar atualização"
+                    style="background:transparent;border:0;color:#63b3ed;font-size:16px;font-weight:bold;width:36px;height:32px;border-radius:8px;cursor:pointer;display:none;flex:0 0 auto;">🔄</button>
+            </div>
             <div id="script-inv-body" style="display:none;width:230px;max-height:70vh;overflow-y:auto;padding-right:2px;">
                 <div id="script-inv-live" style="font-size:10px;color:#a0aec0;padding:2px 4px 6px;text-align:right;"></div>
                 <div id="script-inv-content"></div>
@@ -1304,9 +1359,15 @@
         const toggleBtn = panel.querySelector('#script-inv-toggle');
         const refreshBtn = panel.querySelector('#script-inv-refresh');
         const body = panel.querySelector('#script-inv-body');
+
+        const applyOpenState = (isOpen) => {
+            body.style.display = isOpen ? 'block' : 'none';
+            toggleBtn.style.color = isOpen ? '#ffcc00' : '#a0aec0';
+            refreshBtn.style.display = isOpen ? 'inline-flex' : 'none';
+        };
+
         const open = localStorage.getItem(STORAGE_INV_PANEL_OPEN) === 'true';
-        body.style.display = open ? 'block' : 'none';
-        toggleBtn.style.color = open ? '#ffcc00' : '#a0aec0';
+        applyOpenState(open);
 
         refreshBtn.addEventListener('click', () => {
             requestInventoryFromGame();
@@ -1317,15 +1378,12 @@
 
         toggleBtn.addEventListener('click', () => {
             const isOpen = body.style.display !== 'none';
-            body.style.display = isOpen ? 'none' : 'block';
-            toggleBtn.style.color = isOpen ? '#a0aec0' : '#ffcc00';
+            applyOpenState(!isOpen);
             localStorage.setItem(STORAGE_INV_PANEL_OPEN, String(!isOpen));
             if (!isOpen) {
-                // abre o painel: renderiza o cache atual + pede inventário na hora
                 renderInventoryContent();
                 requestInventoryFromGame();
                 requestBallsFromGame();
-                // fallback DOM só se nada chegar em 1,5s
                 setTimeout(() => {
                     const age = Date.now() - inventoryLastLiveAt;
                     if (age > 1500) {
@@ -1362,26 +1420,24 @@
 
         let html = '';
         for (const cat of INVENTORY_CATEGORIES) {
-            const items = inventoryCache[cat.id] || [];
+            const items = (inventoryCache[cat.id] || []).filter(item => Number(item.qty) > 1);
+            if (!items.length) continue;
             html += `<div style="margin-bottom:8px;">
                 <div style="font-weight:800;font-size:12px;color:#d9c38c;border-bottom:1px solid #3a2c17;padding:4px 2px;margin-bottom:4px;">${cat.label}</div>`;
-            if (!items.length) {
-                html += '<div style="color:#718096;font-size:11px;padding:2px 4px;">—</div>';
-            } else {
-                items.forEach(item => {
-                    const icon = item.iconSrc
-                        ? `<img src="${escapeHTML(item.iconSrc)}" alt="" style="width:24px;height:24px;object-fit:contain;image-rendering:pixelated;flex:none;">`
-                        : '<span style="width:24px;height:24px;flex:none;"></span>';
-                    html += `
-                        <div style="display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:6px;background:rgba(255,255,255,.03);margin-bottom:3px;">
-                            ${icon}
-                            <span style="flex:1;min-width:0;font-size:12px;color:#e2e8f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHTML(item.name)}</span>
-                            <span style="font-weight:800;font-size:12px;color:#f6c453;flex:none;">×${formatNumber(item.qty)}</span>
-                        </div>`;
-                });
-            }
+            items.forEach(item => {
+                const icon = item.iconSrc
+                    ? `<img src="${escapeHTML(item.iconSrc)}" alt="" style="width:24px;height:24px;object-fit:contain;image-rendering:pixelated;flex:none;">`
+                    : '<span style="width:24px;height:24px;flex:none;"></span>';
+                html += `
+                    <div style="display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:6px;background:rgba(255,255,255,.03);margin-bottom:3px;">
+                        ${icon}
+                        <span style="flex:1;min-width:0;font-size:12px;color:#e2e8f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHTML(item.name)}</span>
+                        <span style="font-weight:800;font-size:12px;color:#f6c453;flex:none;">×${formatNumber(item.qty)}</span>
+                    </div>`;
+            });
             html += `</div>`;
         }
+        if (!html) html = '<div style="color:#718096;font-size:11px;padding:6px 4px;text-align:center;">Nenhum item rastreado ainda.</div>';
         content.innerHTML = html;
     }
 
@@ -1469,6 +1525,7 @@
         });
     }
 
+    // ---- Sidebar esquerda: teleporte (fav/last) + dungeon ----
     function injectQuickTPButton() {
         let sidebar = document.getElementById('script-sidebar');
         if (!sidebar) {
@@ -1477,6 +1534,7 @@
             sidebar.style = 'position:fixed;left:8px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:6px;background:rgba(20,16,10,.85);border:2px solid rgb(120,90,40);border-radius:10px;padding:8px 6px;z-index:9000;';
             document.body.appendChild(sidebar);
         }
+
         let tpBtn = document.getElementById('dock-btn-quick-tp');
         if (!tpBtn) {
             tpBtn = document.createElement('button');
@@ -1487,7 +1545,36 @@
             sidebar.appendChild(tpBtn);
             updateNavButtonAppearance();
         }
+
+        let dungeonBtn = document.getElementById('dock-btn-dungeon');
+        if (!dungeonBtn) {
+            dungeonBtn = document.createElement('button');
+            dungeonBtn.id = 'dock-btn-dungeon';
+            dungeonBtn.type = 'button';
+            dungeonBtn.style = 'background:transparent;border:0;color:#a855f7;font-size:16px;font-weight:bold;width:36px;height:36px;border-radius:8px;cursor:pointer;display:none;';
+            dungeonBtn.title = 'Voltar à última dungeon';
+            dungeonBtn.textContent = '🏰';
+            dungeonBtn.addEventListener('click', handleReturnToDungeon);
+            sidebar.appendChild(dungeonBtn);
+            updateDungeonButtonAppearance();
+        }
     }
+
+    function handleReturnToDungeon() {
+        const dungeon = getLastDungeon();
+        if (!dungeon) return showScriptNotice('Nenhuma dungeon registrada ainda.', { title: 'Dungeon' });
+        teleportToTarget(dungeon.name);
+    }
+
+    function updateDungeonButtonAppearance() {
+        const btn = document.getElementById('dock-btn-dungeon');
+        if (!btn) return;
+        const dungeon = getLastDungeon();
+        if (!dungeon) { btn.style.display = 'none'; return; }
+        btn.style.display = 'inline-flex';
+        btn.title = `Voltar à última dungeon: ${dungeon.name}`;
+    }
+
     function handleNavQuickTP() {
         const mode = getNavTpMode();
         if (mode === 'fav') teleportToFavorite();
@@ -1713,6 +1800,7 @@
             }
             ensureInventoryPanel();
             renderInventoryContent();
+            updateDungeonButtonAppearance();
             if (!gameContext) waitForGameContext();
         } catch (e) {
             console.error('[PIW-QOL] Erro no observer:', e);
@@ -1763,6 +1851,7 @@
             }, 5000);
 
             refreshInventoryData().finally(renderInventoryContent);
+            updateDungeonButtonAppearance();
         } catch (e) {
             console.error('[PIW-QOL] Erro na inicialização:', e);
         }
