@@ -7,6 +7,10 @@
 // @match        https://poke.idleworld.online/play
 // @grant        none
 // @run-at       document-start
+// @homepageURL  https://github.com/mateuspedro/PIW-Inventory-idle
+// @supportURL   https://github.com/mateuspedro/PIW-Inventory-idle/issues
+// @updateURL    https://raw.githubusercontent.com/mateuspedro/PIW-Inventory-idle/edit/main/piw-inventory.user.js
+// @downloadURL  https://raw.githubusercontent.com/mateuspedro/PIW-Inventory-idle/edit/main/piw-inventory.user.js
 // ==/UserScript==
 
 (function() {
