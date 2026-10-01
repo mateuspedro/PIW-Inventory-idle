@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PIW — Painel de Inventário em tempo real
 // @namespace    http://tampermonkey.net/
-// @version      2.0.0
-// @description  Painel de inventário (Poké Bolas, Poções, Revives) lido em tempo real via API interna do jogo (React context).
+// @version      2.1.0
+// @description  Painel de inventário (Poké Bolas, Poções, Revives) lido em tempo real via API interna do jogo (React context). Só exibe itens com quantidade ≥ 5.
 // @author       KizaniN
 // @match        https://poke.idleworld.online/play
 // @grant        none
@@ -26,6 +26,7 @@
 
     const INVENTORY_HEARTBEAT_MS = 15000;
     const INVENTORY_RENDER_MS    = 3000;
+    const MIN_ITEM_QUANTITY      = 5;
 
     // ============================================================
     // 1) ESTADO GLOBAL
@@ -110,7 +111,7 @@
                     if (!catalog.length) return;
                     const entries = catalog.map(ball => {
                         const qty = Number(counts[String(ball.id)] ?? 0);
-                        if (qty <= 1) return null;
+                        if (qty < MIN_ITEM_QUANTITY) return null;
                         return {
                             name: ball.name,
                             iconSrc: ball.iconUrl || '',
@@ -166,7 +167,7 @@
         (items || []).forEach(entry => {
             const itemId = String(entry?.itemId ?? '').trim();
             const qty = Number(entry?.quantity ?? 0);
-            if (!itemId || !Number.isFinite(qty) || qty <= 1) return;
+            if (!itemId || !Number.isFinite(qty) || qty < MIN_ITEM_QUANTITY) return;
             const catalog = globalItemApiData.get(itemId);
             const name = catalog?.name || catalog?.title || `Item ${itemId}`;
             const cat = categorizeByName(name);
@@ -240,7 +241,7 @@
                 }
             });
             inventoryCache[cat] = Array.from(byName.values())
-                .filter(e => Number(e.qty) > 1)
+                .filter(e => Number(e.qty) >= MIN_ITEM_QUANTITY)
                 .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
         }
         if (changed) saveInventoryCacheToStorage();
@@ -296,7 +297,7 @@
             const iconSrc = img.getAttribute('src') || '';
             const qtyEl = slot.querySelector('.inv-qty');
             const qty = qtyEl ? (parseInt((qtyEl.textContent || '').replace(/[^0-9]/g, ''), 10) || 0) : 0;
-            if (qty <= 1) return;
+            if (qty < MIN_ITEM_QUANTITY) return;
             entries.push({ name, iconSrc, qty, cat });
         });
         return entries;
@@ -315,7 +316,7 @@
             const nEl = chip.querySelector('.cap-chip-n');
             const qtyText = (nEl?.textContent || '').trim();
             const qty = qtyText ? (parseInt(qtyText.replace(/[^0-9]/g, ''), 10) || 0) : 0;
-            if (qty <= 1) return;
+            if (qty < MIN_ITEM_QUANTITY) return;
             const iconSrc = img?.getAttribute('src') || '';
             const key = `ball:${name.toLowerCase()}`;
             if (seen.has(key)) return;
@@ -331,7 +332,7 @@
                 const rawName = match[1].trim();
                 const rawQty = match[2].replace(/\./g, '').replace(',', '.');
                 const qty = Math.round(Number(rawQty)) || 0;
-                if (qty <= 1) return;
+                if (qty < MIN_ITEM_QUANTITY) return;
                 const iconSrc = findIconForItemName(ahModal, rawName)
                     || `/assets/markitems/${rawName.toLowerCase().replace(/\s+/g, '_')}.png`;
                 const key = `potion:${rawName.toLowerCase()}`;
@@ -358,7 +359,7 @@
         const grouped = { balls: [], potions: [], revives: [] };
         (entries || []).forEach(entry => {
             if (!entry || !entry.cat) return;
-            if (!Number.isFinite(entry.qty) || entry.qty <= 1) return;
+            if (!Number.isFinite(entry.qty) || entry.qty < MIN_ITEM_QUANTITY) return;
             grouped[entry.cat].push(entry);
         });
         Object.keys(grouped).forEach(key => {
@@ -461,7 +462,7 @@
 
         let html = '';
         for (const cat of INVENTORY_CATEGORIES) {
-            const items = (inventoryCache[cat.id] || []).filter(item => Number(item.qty) > 1);
+            const items = (inventoryCache[cat.id] || []).filter(item => Number(item.qty) >= MIN_ITEM_QUANTITY);
             if (!items.length) continue;
             html += `<div style="margin-bottom:8px;">
                 <div style="font-weight:800;font-size:12px;color:#d9c38c;border-bottom:1px solid #3a2c17;padding:4px 2px;margin-bottom:4px;">${cat.label}</div>`;
