@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         PIW — Painel de Inventário em tempo real
 // @namespace    http://tampermonkey.net/
-// @version      2.1.0
-// @description  Painel de inventário (Poké Bolas, Poções, Revives) lido em tempo real via API interna do jogo (React context). Só exibe itens com quantidade ≥ 5.
+// @version      2.2.0
+// @description  Painel de inventário (Poké Bolas, Poções) lido em tempo real via API interna do jogo (React context). Só exibe itens com quantidade ≥ 5.
 // @author       KizaniN
-// @match        https://poke.idleworld.online/play
+// @match        https://poke.idleworld.online/play*
 // @grant        none
 // @run-at       document-start
 // @homepageURL  https://github.com/mateuspedro/PIW-Inventory-idle
@@ -21,12 +21,15 @@
     // ============================================================
     const STORAGE_INV_PANEL_OPEN = 'script_inv_panel_open_v1';
     const STORAGE_INV_CACHE      = 'script_inv_cache_v1';
+    const STORAGE_INV_POS        = 'script_inv_panel_pos_v1';
 
     const ITEMS_JSON_URL = 'https://poke.idleworld.online/game/items.json';
+    const BALLS_API_URL  = '/api/game/balls';
 
     const INVENTORY_HEARTBEAT_MS = 15000;
     const INVENTORY_RENDER_MS    = 3000;
     const MIN_ITEM_QUANTITY      = 5;
+    const CATEGORY_KEYS          = ['balls', 'potions'];
 
     // ============================================================
     // 1) ESTADO GLOBAL
@@ -41,6 +44,7 @@
     let inventorySubscription   = null;
     let ballsSubscription       = null;
     let latestInventory         = null;
+    let subscriptionsBound      = false;
 
     const globalItemApiData = new Map();
 
@@ -86,50 +90,46 @@
     }
 
     function subscribeToInventory() {
-        if (!gameContext) return;
+        if (!gameContext || subscriptionsBound) return;
 
-        if (!inventorySubscription) {
-            try {
-                inventorySubscription = gameContext.subscribe('inventory', message => {
-                    const items = Array.isArray(message?.items) ? message.items : [];
-                    if (!items.length) return;
-                    latestInventory = items;
-                    inventoryLastLiveAt = Date.now();
-                    mergeIntoInventoryCache(groupInventoryFromSocket(items));
-                    scheduleInventoryPanelRefresh();
-                });
-            } catch (e) {
-                console.warn('[PIW-QOL] Falha ao assinar inventory:', e);
-            }
+        try {
+            inventorySubscription = gameContext.subscribe('inventory', message => {
+                const items = Array.isArray(message?.items) ? message.items : [];
+                if (!items.length) return;
+                latestInventory = items;
+                inventoryLastLiveAt = Date.now();
+                mergeIntoInventoryCache(groupInventoryFromSocket(items));
+                scheduleInventoryPanelRefresh();
+            });
+        } catch (e) {
+            console.warn('[PIW-Inventory] Falha ao assinar inventory:', e);
         }
 
-        if (!ballsSubscription) {
-            try {
-                ballsSubscription = gameContext.subscribe('balls', message => {
-                    const catalog = Array.isArray(message?.catalog) ? message.catalog : [];
-                    const counts = message?.counts || {};
-                    if (!catalog.length) return;
-                    const entries = catalog.map(ball => {
-                        const qty = Number(counts[String(ball.id)] ?? 0);
-                        if (qty < MIN_ITEM_QUANTITY) return null;
-                        return {
-                            name: ball.name,
-                            iconSrc: ball.iconUrl || '',
-                            qty,
-                            cat: 'balls'
-                        };
-                    }).filter(Boolean);
-                    if (!entries.length) return;
-                    inventoryLastLiveAt = Date.now();
-                    mergeIntoInventoryCache(groupEntries(entries));
-                    scheduleInventoryPanelRefresh();
+        try {
+            ballsSubscription = gameContext.subscribe('balls', message => {
+                const catalog = Array.isArray(message?.catalog) ? message.catalog : [];
+                const counts = message?.counts || {};
+                if (!catalog.length) return;
+                const entries = catalog.flatMap(ball => {
+                    const qty = Number(counts[String(ball.id)] ?? 0);
+                    if (qty < MIN_ITEM_QUANTITY) return [];
+                    return [{
+                        name: ball.name,
+                        iconSrc: ball.iconUrl || '',
+                        qty,
+                        cat: 'balls'
+                    }];
                 });
-            } catch (e) {
-                console.warn('[PIW-QOL] Falha ao assinar balls:', e);
-            }
+                if (!entries.length) return;
+                inventoryLastLiveAt = Date.now();
+                mergeIntoInventoryCache(groupEntries(entries));
+                scheduleInventoryPanelRefresh();
+            });
+        } catch (e) {
+            console.warn('[PIW-Inventory] Falha ao assinar balls:', e);
         }
 
-        ['field-kill', 'catch-result', 'poke-xp', 'item-use', 'ball-use', 'potion-use', 'revive', 'shop-buy']
+        ['field-kill', 'catch-result', 'poke-xp', 'item-use', 'ball-use', 'potion-use', 'shop-buy']
             .forEach(type => {
                 try {
                     gameContext.subscribe(type, () => {
@@ -137,6 +137,8 @@
                     });
                 } catch { /* tipo pode não existir */ }
             });
+
+        subscriptionsBound = true;
     }
 
     function requestInventoryFromGame() {
@@ -163,7 +165,7 @@
     }
 
     function groupInventoryFromSocket(items) {
-        const grouped = { balls: [], potions: [], revives: [] };
+        const grouped = { balls: [], potions: [] };
         (items || []).forEach(entry => {
             const itemId = String(entry?.itemId ?? '').trim();
             const qty = Number(entry?.quantity ?? 0);
@@ -176,7 +178,7 @@
             const iconSrc = normalizeGameItemIcon(iconRaw);
             grouped[cat].push({ name, iconSrc, qty, cat });
         });
-        Object.keys(grouped).forEach(key => {
+        CATEGORY_KEYS.forEach(key => {
             grouped[key].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
         });
         return grouped;
@@ -210,12 +212,11 @@
             if (parsed && typeof parsed === 'object') {
                 return {
                     balls: Array.isArray(parsed.balls) ? parsed.balls : [],
-                    potions: Array.isArray(parsed.potions) ? parsed.potions : [],
-                    revives: Array.isArray(parsed.revives) ? parsed.revives : []
+                    potions: Array.isArray(parsed.potions) ? parsed.potions : []
                 };
             }
         } catch { /* ignore */ }
-        return { balls: [], potions: [], revives: [] };
+        return { balls: [], potions: [] };
     }
     function saveInventoryCacheToStorage() {
         try {
@@ -224,7 +225,7 @@
     }
     function mergeIntoInventoryCache(grouped) {
         let changed = false;
-        for (const cat of ['balls', 'potions', 'revives']) {
+        for (const cat of CATEGORY_KEYS) {
             const incoming = grouped[cat] || [];
             if (!incoming.length) continue;
             const current = inventoryCache[cat] || [];
@@ -274,13 +275,12 @@
         const n = String(name || '').toLowerCase();
         if (/\b(pok[eé]\s*ball|great\s*ball|super\s*ball|ultra\s*ball|idle\s*ball|master\s*ball|golden\s*idle\s*ball)\b/.test(n)) return 'balls';
         if (/\bpotion\b/.test(n)) return 'potions';
-        if (/\brevive\b/.test(n)) return 'revives';
         return null;
     }
 
     // === Fallback DOM (só usado se o gameContext não existir) ===
     function readInventoryFromGrid() {
-        const grid = document.querySelector('.inv-grid');
+        const grid = document.querySelector('.inv-grid, .inv-slots, .inv-items');
         if (!grid) return [];
         const entries = [];
         grid.querySelectorAll('.inv-slot').forEach(slot => {
@@ -356,13 +356,13 @@
         return '';
     }
     function groupEntries(entries) {
-        const grouped = { balls: [], potions: [], revives: [] };
+        const grouped = { balls: [], potions: [] };
         (entries || []).forEach(entry => {
             if (!entry || !entry.cat) return;
             if (!Number.isFinite(entry.qty) || entry.qty < MIN_ITEM_QUANTITY) return;
             grouped[entry.cat].push(entry);
         });
-        Object.keys(grouped).forEach(key => {
+        CATEGORY_KEYS.forEach(key => {
             grouped[key].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
         });
         return grouped;
@@ -373,9 +373,24 @@
     // ============================================================
     const INVENTORY_CATEGORIES = [
         { id: 'balls',   label: '🔴 Poké Bolas' },
-        { id: 'potions', label: '💊 Poções' },
-        { id: 'revives', label: '✨ Revives' }
+        { id: 'potions', label: '💊 Poções' }
     ];
+
+    function applyPanelPosition(panel) {
+        try {
+            const stored = JSON.parse(localStorage.getItem(STORAGE_INV_POS) || 'null');
+            if (stored && Number.isFinite(stored.left) && Number.isFinite(stored.top)) {
+                panel.style.left = `${stored.left}px`;
+                panel.style.top = `${stored.top}px`;
+                panel.style.right = 'auto';
+                panel.style.transform = 'none';
+                return;
+            }
+        } catch { /* ignore */ }
+        panel.style.right = '8px';
+        panel.style.top = '50%';
+        panel.style.transform = 'translateY(-50%)';
+    }
 
     function ensureInventoryPanel() {
         let panel = document.getElementById('script-inv-panel');
@@ -383,9 +398,9 @@
 
         panel = document.createElement('div');
         panel.id = 'script-inv-panel';
-        panel.style = 'position:fixed;right:8px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:6px;background:rgba(20,16,10,.88);border:2px solid rgb(120,90,40);border-radius:10px;padding:8px 6px;z-index:9000;max-height:80vh;overflow:hidden;font-family:sans-serif;color:#e2e8f0;';
+        panel.style = 'position:fixed;display:flex;flex-direction:column;gap:6px;background:rgba(20,16,10,.88);border:2px solid rgb(120,90,40);border-radius:10px;padding:8px 6px;z-index:9000;max-height:80vh;overflow:hidden;font-family:sans-serif;color:#e2e8f0;';
         panel.innerHTML = `
-            <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;width:100%;">
+            <div id="script-inv-drag" style="display:flex;align-items:center;justify-content:space-between;gap:4px;width:100%;cursor:grab;user-select:none;">
                 <button id="script-inv-toggle" type="button" title="Mostrar/ocultar inventário"
                     style="background:transparent;border:0;color:#ffcc00;font-size:18px;font-weight:bold;width:36px;height:32px;border-radius:8px;cursor:pointer;flex:0 0 auto;">🎒</button>
                 <button id="script-inv-refresh" type="button" title="Forçar atualização"
@@ -397,10 +412,12 @@
             </div>
         `;
         document.body.appendChild(panel);
+        applyPanelPosition(panel);
 
         const toggleBtn = panel.querySelector('#script-inv-toggle');
         const refreshBtn = panel.querySelector('#script-inv-refresh');
         const body = panel.querySelector('#script-inv-body');
+        const dragHandle = panel.querySelector('#script-inv-drag');
 
         const applyOpenState = (isOpen) => {
             body.style.display = isOpen ? 'block' : 'none';
@@ -418,7 +435,8 @@
             setTimeout(() => { refreshBtn.style.opacity = '1'; }, 500);
         });
 
-        toggleBtn.addEventListener('click', () => {
+        toggleBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
             const isOpen = body.style.display !== 'none';
             applyOpenState(!isOpen);
             localStorage.setItem(STORAGE_INV_PANEL_OPEN, String(!isOpen));
@@ -439,6 +457,48 @@
                 }, 1500);
             }
         });
+
+        // Arrastar pelo cabeçalho
+        let isDragging = false;
+        let dragStartX = 0, dragStartY = 0, panelStartLeft = 0, panelStartTop = 0;
+        dragHandle.addEventListener('pointerdown', (event) => {
+            if (event.target.closest('button')) return;
+            const rect = panel.getBoundingClientRect();
+            isDragging = true;
+            dragStartX = event.clientX;
+            dragStartY = event.clientY;
+            panelStartLeft = rect.left;
+            panelStartTop = rect.top;
+            panel.style.right = 'auto';
+            panel.style.transform = 'none';
+            panel.style.left = `${rect.left}px`;
+            panel.style.top = `${rect.top}px`;
+            dragHandle.style.cursor = 'grabbing';
+            dragHandle.setPointerCapture?.(event.pointerId);
+            event.preventDefault();
+        });
+        dragHandle.addEventListener('pointermove', (event) => {
+            if (!isDragging) return;
+            const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
+            const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
+            const nextLeft = Math.min(maxLeft, Math.max(0, panelStartLeft + event.clientX - dragStartX));
+            const nextTop = Math.min(maxTop, Math.max(0, panelStartTop + event.clientY - dragStartY));
+            panel.style.left = `${nextLeft}px`;
+            panel.style.top = `${nextTop}px`;
+        });
+        const stopDrag = () => {
+            if (!isDragging) return;
+            isDragging = false;
+            dragHandle.style.cursor = 'grab';
+            try {
+                localStorage.setItem(STORAGE_INV_POS, JSON.stringify({
+                    left: parseFloat(panel.style.left),
+                    top: parseFloat(panel.style.top)
+                }));
+            } catch { /* ignore */ }
+        };
+        dragHandle.addEventListener('pointerup', stopDrag);
+        dragHandle.addEventListener('pointercancel', stopDrag);
 
         return panel;
     }
@@ -461,9 +521,11 @@
         lastInventorySignature = signature;
 
         let html = '';
+        let totalTracked = 0;
         for (const cat of INVENTORY_CATEGORIES) {
             const items = (inventoryCache[cat.id] || []).filter(item => Number(item.qty) >= MIN_ITEM_QUANTITY);
             if (!items.length) continue;
+            totalTracked += items.length;
             html += `<div style="margin-bottom:8px;">
                 <div style="font-weight:800;font-size:12px;color:#d9c38c;border-bottom:1px solid #3a2c17;padding:4px 2px;margin-bottom:4px;">${cat.label}</div>`;
             items.forEach(item => {
@@ -479,7 +541,11 @@
             });
             html += `</div>`;
         }
-        if (!html) html = '<div style="color:#718096;font-size:11px;padding:6px 4px;text-align:center;">Nenhum item rastreado ainda.</div>';
+        if (!html) {
+            html = '<div style="color:#718096;font-size:11px;padding:6px 4px;text-align:center;">Nenhum item rastreado ainda.</div>';
+        } else {
+            html += `<div style="font-size:10px;color:#718096;padding:6px 4px 0;text-align:right;border-top:1px solid #1f2b36;margin-top:6px;">${totalTracked} tipo(s) rastreado(s)</div>`;
+        }
         content.innerHTML = html;
     }
 
@@ -536,7 +602,7 @@
             renderInventoryContent();
             if (!gameContext) waitForGameContext();
         } catch (e) {
-            console.error('[PIW-QOL] Erro no observer:', e);
+            console.error('[PIW-Inventory] Erro no observer:', e);
         }
     }
 
@@ -557,18 +623,18 @@
 
             waitForGameContext().then(ctx => {
                 if (ctx) {
-                    console.info('[PIW-QOL] gameContext encontrado. Inventário em tempo real ativo.');
+                    console.info('[PIW-Inventory] gameContext encontrado. Inventário em tempo real ativo.');
                     requestInventoryFromGame();
                     setTimeout(() => requestInventoryFromGame(), 1000);
                     setTimeout(() => requestInventoryFromGame(), 3000);
                 } else {
-                    console.warn('[PIW-QOL] gameContext não encontrado — usando DOM como fallback.');
+                    console.warn('[PIW-Inventory] gameContext não encontrado — usando DOM como fallback.');
                 }
             });
 
             refreshInventoryData().finally(renderInventoryContent);
         } catch (e) {
-            console.error('[PIW-QOL] Erro na inicialização:', e);
+            console.error('[PIW-Inventory] Erro na inicialização:', e);
         }
     }
 
