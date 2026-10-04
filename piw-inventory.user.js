@@ -376,17 +376,21 @@
         { id: 'potions', label: '💊 Poções' }
     ];
 
-    function applyPanelPosition(panel) {
-        try {
-            const stored = JSON.parse(localStorage.getItem(STORAGE_INV_POS) || 'null');
-            if (stored && Number.isFinite(stored.left) && Number.isFinite(stored.top)) {
-                panel.style.left = `${stored.left}px`;
-                panel.style.top = `${stored.top}px`;
-                panel.style.right = 'auto';
-                panel.style.transform = 'none';
-                return;
-            }
-        } catch { /* ignore */ }
+    function applyPanelPosition(panel, isOpen) {
+        if (isOpen) {
+            try {
+                const stored = JSON.parse(localStorage.getItem(STORAGE_INV_POS) || 'null');
+                if (stored && Number.isFinite(stored.left) && Number.isFinite(stored.top)) {
+                    panel.style.left = `${stored.left}px`;
+                    panel.style.top = `${stored.top}px`;
+                    panel.style.right = 'auto';
+                    panel.style.transform = 'none';
+                    return;
+                }
+            } catch { /* ignore */ }
+        }
+        // Posição padrão (fechado, ou aberto sem posição salva)
+        panel.style.left = 'auto';
         panel.style.right = '8px';
         panel.style.top = '50%';
         panel.style.transform = 'translateY(-50%)';
@@ -412,7 +416,8 @@
             </div>
         `;
         document.body.appendChild(panel);
-        applyPanelPosition(panel);
+        const initialOpen = localStorage.getItem(STORAGE_INV_PANEL_OPEN) === 'true';
+        applyPanelPosition(panel, initialOpen);
 
         const toggleBtn = panel.querySelector('#script-inv-toggle');
         const refreshBtn = panel.querySelector('#script-inv-refresh');
@@ -423,10 +428,12 @@
             body.style.display = isOpen ? 'block' : 'none';
             toggleBtn.style.color = isOpen ? '#ffcc00' : '#a0aec0';
             refreshBtn.style.display = isOpen ? 'inline-flex' : 'none';
+            // Ao fechar, o painel volta para o canto. Ao abrir, volta para
+            // a posição que o usuário deixou salva.
+            applyPanelPosition(panel, isOpen);
         };
 
-        const open = localStorage.getItem(STORAGE_INV_PANEL_OPEN) === 'true';
-        applyOpenState(open);
+        applyOpenState(initialOpen);
 
         refreshBtn.addEventListener('click', () => {
             requestInventoryFromGame();
@@ -462,6 +469,7 @@
         let isDragging = false;
         let dragStartX = 0, dragStartY = 0, panelStartLeft = 0, panelStartTop = 0;
         dragHandle.addEventListener('pointerdown', (event) => {
+            if (body.style.display === 'none') return;
             if (event.target.closest('button')) return;
             const rect = panel.getBoundingClientRect();
             isDragging = true;
@@ -490,6 +498,10 @@
             if (!isDragging) return;
             isDragging = false;
             dragHandle.style.cursor = 'grab';
+            // Só salva a posição se o painel estiver aberto (o usuário arrastou
+            // para um lugar que ele quer manter). Quando fechado, o painel
+            // sempre vai para o canto.
+            if (body.style.display === 'none') return;
             try {
                 localStorage.setItem(STORAGE_INV_POS, JSON.stringify({
                     left: parseFloat(panel.style.left),
