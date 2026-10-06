@@ -20,31 +20,31 @@
     // 0) CONSTANTES
     // ============================================================
     const STORAGE_INV_PANEL_OPEN = 'script_inv_panel_open_v1';
-    const STORAGE_INV_CACHE      = 'script_inv_cache_v1';
-    const STORAGE_INV_POS        = 'script_inv_panel_pos_v1';
+    const STORAGE_INV_CACHE = 'script_inv_cache_v1';
+    const STORAGE_INV_POS = 'script_inv_panel_pos_v1';
 
     const ITEMS_JSON_URL = 'https://poke.idleworld.online/game/items.json';
-    const BALLS_API_URL  = '/api/game/balls';
+    const BALLS_API_URL = '/api/game/balls';
 
     const INVENTORY_HEARTBEAT_MS = 15000;
-    const INVENTORY_RENDER_MS    = 3000;
-    const MIN_ITEM_QUANTITY      = 5;
-    const CATEGORY_KEYS          = ['balls', 'potions'];
+    const INVENTORY_RENDER_MS = 3000;
+    const MIN_ITEM_QUANTITY = 5;
+    const CATEGORY_KEYS = ['balls', 'potions'];
 
     // ============================================================
     // 1) ESTADO GLOBAL
     // ============================================================
-    let inventoryRenderTimeout  = null;
-    let lastInventorySignature  = '';
-    let inventoryRefreshTimer   = null;
+    let inventoryRenderTimeout = null;
+    let lastInventorySignature = '';
+    let inventoryRefreshTimer = null;
     let inventoryHeartbeatTimer = null;
-    let observerDebounceTimer   = null;
-    let gameContextPromise      = null;
-    let gameContext             = null;
-    let inventorySubscription   = null;
-    let ballsSubscription       = null;
-    let latestInventory         = null;
-    let subscriptionsBound      = false;
+    let observerDebounceTimer = null;
+    let gameContextPromise = null;
+    let gameContext = null;
+    let inventorySubscription = null;
+    let ballsSubscription = null;
+    let latestInventory = null;
+    let subscriptionsBound = false;
 
     const globalItemApiData = new Map();
 
@@ -130,13 +130,14 @@
         }
 
         ['field-kill', 'catch-result', 'poke-xp', 'item-use', 'ball-use', 'potion-use', 'shop-buy']
-            .forEach(type => {
-                try {
-                    gameContext.subscribe(type, () => {
-                        setTimeout(() => requestInventoryFromGame(), 400);
-                    });
-                } catch { /* tipo pode não existir */ }
-            });
+        .forEach(type => {
+            try {
+                gameContext.subscribe(type, () => {
+                    setTimeout(() => requestInventoryFromGame(), 400);
+                });
+            } catch {
+                /* tipo pode não existir */ }
+        });
 
         subscriptionsBound = true;
     }
@@ -144,7 +145,9 @@
     function requestInventoryFromGame() {
         if (!gameContext) return false;
         try {
-            gameContext.send({ type: 'inv-get' });
+            gameContext.send({
+                type: 'inv-get'
+            });
             requestBallsFromGame();
             return true;
         } catch {
@@ -159,13 +162,20 @@
                 gameContext.requestBalls();
                 return true;
             }
-            gameContext.send({ type: 'balls-get' });
+            gameContext.send({
+                type: 'balls-get'
+            });
             return true;
-        } catch { return false; }
+        } catch {
+            return false;
+        }
     }
 
     function groupInventoryFromSocket(items) {
-        const grouped = { balls: [], potions: [] };
+        const grouped = {
+            balls: [],
+            potions: []
+        };
         (items || []).forEach(entry => {
             const itemId = String(entry?.itemId ?? '').trim();
             const qty = Number(entry?.quantity ?? 0);
@@ -176,7 +186,12 @@
             if (!cat) return;
             const iconRaw = catalog?.icon || catalog?.image || catalog?.sprite || '';
             const iconSrc = normalizeGameItemIcon(iconRaw);
-            grouped[cat].push({ name, iconSrc, qty, cat });
+            grouped[cat].push({
+                name,
+                iconSrc,
+                qty,
+                cat
+            });
         });
         CATEGORY_KEYS.forEach(key => {
             grouped[key].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
@@ -189,17 +204,24 @@
     // ============================================================
     function escapeHTML(value) {
         return String(value ?? '').replace(/[&<>"']/g, char => ({
-            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#039;'
         })[char]);
     }
+
     function normalizePokemonName(name) {
         return String(name || '').toLowerCase().normalize('NFKD')
             .replace(/[\u0300-\u036f]/g, '').replace(/[._]/g, ' ')
             .replace(/\s+/g, ' ').trim();
     }
+
     function formatNumber(num) {
         return new Intl.NumberFormat('pt-BR').format(num);
     }
+
     function normalizeGameItemIcon(icon) {
         if (!icon) return '';
         if (/^(https?:)?\//.test(icon)) return icon;
@@ -215,14 +237,21 @@
                     potions: Array.isArray(parsed.potions) ? parsed.potions : []
                 };
             }
-        } catch { /* ignore */ }
-        return { balls: [], potions: [] };
+        } catch {
+            /* ignore */ }
+        return {
+            balls: [],
+            potions: []
+        };
     }
+
     function saveInventoryCacheToStorage() {
         try {
             localStorage.setItem(STORAGE_INV_CACHE, JSON.stringify(inventoryCache));
-        } catch { /* ignore */ }
+        } catch {
+            /* ignore */ }
     }
+
     function mergeIntoInventoryCache(grouped) {
         let changed = false;
         for (const cat of CATEGORY_KEYS) {
@@ -234,11 +263,19 @@
                 const key = normalizePokemonName(entry.name);
                 const existing = byName.get(key);
                 if (!existing) {
-                    byName.set(key, { ...entry });
+                    byName.set(key, {
+                        ...entry
+                    });
                     changed = true;
                 } else {
-                    if (existing.qty !== entry.qty) { existing.qty = entry.qty; changed = true; }
-                    if (!existing.iconSrc && entry.iconSrc) { existing.iconSrc = entry.iconSrc; changed = true; }
+                    if (existing.qty !== entry.qty) {
+                        existing.qty = entry.qty;
+                        changed = true;
+                    }
+                    if (!existing.iconSrc && entry.iconSrc) {
+                        existing.iconSrc = entry.iconSrc;
+                        changed = true;
+                    }
                 }
             });
             inventoryCache[cat] = Array.from(byName.values())
@@ -298,10 +335,16 @@
             const qtyEl = slot.querySelector('.inv-qty');
             const qty = qtyEl ? (parseInt((qtyEl.textContent || '').replace(/[^0-9]/g, ''), 10) || 0) : 0;
             if (qty < MIN_ITEM_QUANTITY) return;
-            entries.push({ name, iconSrc, qty, cat });
+            entries.push({
+                name,
+                iconSrc,
+                qty,
+                cat
+            });
         });
         return entries;
     }
+
     function readInventoryFromAutoHelper() {
         const ahModal = document.querySelector('.ah-modal');
         if (!ahModal) return [];
@@ -321,7 +364,12 @@
             const key = `ball:${name.toLowerCase()}`;
             if (seen.has(key)) return;
             seen.add(key);
-            entries.push({ name, iconSrc, qty, cat: 'balls' });
+            entries.push({
+                name,
+                iconSrc,
+                qty,
+                cat: 'balls'
+            });
         });
         ahModal.querySelectorAll('select.ah-sel').forEach(sel => {
             sel.querySelectorAll('option').forEach(opt => {
@@ -333,16 +381,22 @@
                 const rawQty = match[2].replace(/\./g, '').replace(',', '.');
                 const qty = Math.round(Number(rawQty)) || 0;
                 if (qty < MIN_ITEM_QUANTITY) return;
-                const iconSrc = findIconForItemName(ahModal, rawName)
-                    || `/assets/markitems/${rawName.toLowerCase().replace(/\s+/g, '_')}.png`;
+                const iconSrc = findIconForItemName(ahModal, rawName) ||
+                    `/assets/markitems/${rawName.toLowerCase().replace(/\s+/g, '_')}.png`;
                 const key = `potion:${rawName.toLowerCase()}`;
                 if (seen.has(key)) return;
                 seen.add(key);
-                entries.push({ name: rawName, iconSrc, qty, cat: 'potions' });
+                entries.push({
+                    name: rawName,
+                    iconSrc,
+                    qty,
+                    cat: 'potions'
+                });
             });
         });
         return entries;
     }
+
     function findIconForItemName(root, name) {
         const wanted = normalizePokemonName(name);
         const imgs = Array.from(root.querySelectorAll('img'));
@@ -355,8 +409,12 @@
         }
         return '';
     }
+
     function groupEntries(entries) {
-        const grouped = { balls: [], potions: [] };
+        const grouped = {
+            balls: [],
+            potions: []
+        };
         (entries || []).forEach(entry => {
             if (!entry || !entry.cat) return;
             if (!Number.isFinite(entry.qty) || entry.qty < MIN_ITEM_QUANTITY) return;
@@ -371,9 +429,14 @@
     // ============================================================
     // 5) PAINEL
     // ============================================================
-    const INVENTORY_CATEGORIES = [
-        { id: 'balls',   label: '🔴 Poké Bolas' },
-        { id: 'potions', label: '💊 Poções' }
+    const INVENTORY_CATEGORIES = [{
+            id: 'balls',
+            label: '🔴 Poké Bolas'
+        },
+        {
+            id: 'potions',
+            label: '💊 Poções'
+        }
     ];
 
     function applyPanelPosition(panel, isOpen) {
@@ -381,15 +444,29 @@
             try {
                 const stored = JSON.parse(localStorage.getItem(STORAGE_INV_POS) || 'null');
                 if (stored && Number.isFinite(stored.left) && Number.isFinite(stored.top)) {
-                    panel.style.left = `${stored.left}px`;
-                    panel.style.top = `${stored.top}px`;
+                    const panelWidth = panel.offsetWidth || 250;
+                    const panelHeight = panel.offsetHeight || 300;
+                    const maxLeft = Math.max(0, window.innerWidth - panelWidth - 8);
+                    const maxTop = Math.max(0, window.innerHeight - panelHeight - 8);
+                    const safeLeft = Math.min(maxLeft, Math.max(8, stored.left));
+                    const safeTop = Math.min(maxTop, Math.max(8, stored.top));
+
+                    panel.style.left = `${safeLeft}px`;
+                    panel.style.top = `${safeTop}px`;
                     panel.style.right = 'auto';
                     panel.style.transform = 'none';
+
+                    if (safeLeft !== stored.left || safeTop !== stored.top) {
+                        localStorage.setItem(STORAGE_INV_POS, JSON.stringify({
+                            left: safeLeft,
+                            top: safeTop
+                        }));
+                    }
                     return;
                 }
-            } catch { /* ignore */ }
+            } catch {
+                /* ignore */ }
         }
-        // Posição padrão (fechado, ou aberto sem posição salva)
         panel.style.left = 'auto';
         panel.style.right = '8px';
         panel.style.top = '50%';
@@ -439,7 +516,9 @@
             requestInventoryFromGame();
             requestBallsFromGame();
             refreshBtn.style.opacity = '0.4';
-            setTimeout(() => { refreshBtn.style.opacity = '1'; }, 500);
+            setTimeout(() => {
+                refreshBtn.style.opacity = '1';
+            }, 500);
         });
 
         toggleBtn.addEventListener('click', (e) => {
@@ -465,9 +544,20 @@
             }
         });
 
+        toggleBtn.addEventListener('dblclick', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            localStorage.removeItem(STORAGE_INV_POS);
+            applyPanelPosition(panel, true);
+            clampPanelToViewport();
+        });
+
         // Arrastar pelo cabeçalho
         let isDragging = false;
-        let dragStartX = 0, dragStartY = 0, panelStartLeft = 0, panelStartTop = 0;
+        let dragStartX = 0,
+            dragStartY = 0,
+            panelStartLeft = 0,
+            panelStartTop = 0;
         dragHandle.addEventListener('pointerdown', (event) => {
             if (body.style.display === 'none') return;
             if (event.target.closest('button')) return;
@@ -498,16 +588,17 @@
             if (!isDragging) return;
             isDragging = false;
             dragHandle.style.cursor = 'grab';
-            // Só salva a posição se o painel estiver aberto (o usuário arrastou
-            // para um lugar que ele quer manter). Quando fechado, o painel
-            // sempre vai para o canto.
             if (body.style.display === 'none') return;
+            const left = parseFloat(panel.style.left);
+            const top = parseFloat(panel.style.top);
+            if (!Number.isFinite(left) || !Number.isFinite(top)) return;
             try {
                 localStorage.setItem(STORAGE_INV_POS, JSON.stringify({
-                    left: parseFloat(panel.style.left),
-                    top: parseFloat(panel.style.top)
+                    left,
+                    top
                 }));
-            } catch { /* ignore */ }
+            } catch {
+                /* ignore */ }
         };
         dragHandle.addEventListener('pointerup', stopDrag);
         dragHandle.addEventListener('pointercancel', stopDrag);
@@ -522,9 +613,13 @@
 
         const ageMs = Date.now() - inventoryLastLiveAt;
         const isLive = ageMs < 20000;
-        const when = inventoryLastLiveAt
-            ? new Date(inventoryLastLiveAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-            : '—';
+        const when = inventoryLastLiveAt ?
+            new Date(inventoryLastLiveAt).toLocaleTimeString('pt-BR', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            }) :
+            '—';
         liveEl.textContent = `${isLive ? '● ao vivo' : '○ cache'} · ${when}`;
         liveEl.style.color = isLive ? '#48bb78' : '#a0aec0';
 
@@ -541,9 +636,9 @@
             html += `<div style="margin-bottom:8px;">
                 <div style="font-weight:800;font-size:12px;color:#d9c38c;border-bottom:1px solid #3a2c17;padding:4px 2px;margin-bottom:4px;">${cat.label}</div>`;
             items.forEach(item => {
-                const icon = item.iconSrc
-                    ? `<img src="${escapeHTML(item.iconSrc)}" alt="" style="width:24px;height:24px;object-fit:contain;image-rendering:pixelated;flex:none;">`
-                    : '<span style="width:24px;height:24px;flex:none;"></span>';
+                const icon = item.iconSrc ?
+                    `<img src="${escapeHTML(item.iconSrc)}" alt="" style="width:24px;height:24px;object-fit:contain;image-rendering:pixelated;flex:none;">` :
+                    '<span style="width:24px;height:24px;flex:none;"></span>';
                 html += `
                     <div style="display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:6px;background:rgba(255,255,255,.03);margin-bottom:3px;">
                         ${icon}
@@ -591,7 +686,8 @@
         inventoryHeartbeatTimer = setInterval(() => {
             try {
                 if (gameContext) requestInventoryFromGame();
-            } catch (e) { /* nunca deixa o timer morrer */ }
+            } catch (e) {
+                /* nunca deixa o timer morrer */ }
         }, INVENTORY_HEARTBEAT_MS);
 
         if (inventoryRefreshTimer) clearInterval(inventoryRefreshTimer);
@@ -601,7 +697,8 @@
                 if (!panel) return;
                 const body = panel.querySelector('#script-inv-body');
                 if (body && body.style.display !== 'none') renderInventoryContent();
-            } catch (e) { /* nunca deixa o timer morrer */ }
+            } catch (e) {
+                /* nunca deixa o timer morrer */ }
         }, INVENTORY_RENDER_MS);
     }
 
@@ -626,12 +723,40 @@
         }, 300);
     });
 
+    function clampPanelToViewport() {
+        const panel = document.getElementById('script-inv-panel');
+        if (!panel) return;
+        const body = panel.querySelector('#script-inv-body');
+        if (!body || body.style.display === 'none') return;
+        const rect = panel.getBoundingClientRect();
+        const panelWidth = panel.offsetWidth;
+        const panelHeight = panel.offsetHeight;
+        const maxLeft = Math.max(0, window.innerWidth - panelWidth - 8);
+        const maxTop = Math.max(0, window.innerHeight - panelHeight - 8);
+        const safeLeft = Math.min(maxLeft, Math.max(8, rect.left));
+        const safeTop = Math.min(maxTop, Math.max(8, rect.top));
+        if (safeLeft !== rect.left || safeTop !== rect.top) {
+            panel.style.left = `${safeLeft}px`;
+            panel.style.top = `${safeTop}px`;
+            panel.style.right = 'auto';
+            panel.style.transform = 'none';
+        }
+    }
+
     function initialize() {
         try {
             loadItemCatalog();
             ensureInventoryPanel();
             startInventoryAutoRefresh();
-            observer.observe(document.body, { childList: true, subtree: true });
+            observer.observe(document.body, {
+                childList: true,
+                subtree: true
+            });
+
+            // === clamp de viewport ===
+            window.addEventListener('resize', clampPanelToViewport);
+            window.addEventListener('orientationchange', clampPanelToViewport);
+            setInterval(clampPanelToViewport, 2000);
 
             waitForGameContext().then(ctx => {
                 if (ctx) {
@@ -651,7 +776,9 @@
     }
 
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', initialize, { once: true });
+        document.addEventListener('DOMContentLoaded', initialize, {
+            once: true
+        });
     } else {
         initialize();
     }
