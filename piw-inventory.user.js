@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PIW — Painel de Inventário em tempo real
 // @namespace    http://tampermonkey.net/
-// @version      2.2.0
+// @version      2.3.0
 // @description  Painel de inventário (Poké Bolas, Poções) lido em tempo real via API interna do jogo (React context). Só exibe itens com quantidade ≥ 5.
 // @author       KizaniN
 // @match        https://poke.idleworld.online/play*
